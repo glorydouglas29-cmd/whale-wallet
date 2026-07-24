@@ -91,6 +91,16 @@
   </header>
 
   <div class="panel">
+    <div class="panel-title">Scan a token for whales</div>
+    <div class="add-row">
+      <input type="text" id="scanMint" placeholder="Token contract / mint address…">
+      <button id="scanBtn">Scan</button>
+    </div>
+    <div class="status-line" id="scanStatus"></div>
+    <div id="scanResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Track a wallet</div>
     <div class="add-row">
       <input type="text" id="addAddr" placeholder="Wallet address…">
@@ -222,6 +232,65 @@ async function loadDiscordStatus(){
     $('discordStatus').textContent = 'Could not check status.';
   }
 }
+
+$('scanBtn').addEventListener('click', async ()=>{
+  const mint = $('scanMint').value.trim();
+  const statusEl = $('scanStatus');
+  const resultsEl = $('scanResults');
+  resultsEl.innerHTML = '';
+  if(!mint){ statusEl.textContent = 'Enter a token contract address.'; statusEl.className='status-line err'; return; }
+
+  $('scanBtn').disabled = true;
+  statusEl.textContent = 'Scanning top holders…'; statusEl.className='status-line';
+  try{
+    const res = await fetch(`/api/scan-token?mint=${encodeURIComponent(mint)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const holders = data.holders || [];
+    const wallets = holders.filter(h => h.type === 'wallet');
+    const excluded = holders.length - wallets.length;
+    statusEl.textContent = excluded > 0
+      ? `Found ${wallets.length} wallet holder${wallets.length===1?'':'s'} (${excluded} pool/program account${excluded===1?'':'s'} excluded).`
+      : `Found ${wallets.length} wallet holder${wallets.length===1?'':'s'}.`;
+    statusEl.className = 'status-line ok';
+
+    if(!wallets.length){
+      resultsEl.innerHTML = `<div class="empty">No individual wallet holders found in the top holders — likely a very new or thinly-held token.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = wallets.map(h=>`
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(h.address)} — ${h.pctSupply.toFixed(2)}% of supply</div>
+          <div class="wallet-addr">${h.address}</div>
+        </div>
+        <button class="ghost" data-track="${h.address}">Track</button>
+      </div>`).join('');
+
+    resultsEl.querySelectorAll('button[data-track]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        btn.disabled = true; btn.textContent = 'Adding…';
+        try{
+          const r = await fetch('/api/wallets', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ address: btn.dataset.track, label: 'Whale' }),
+          });
+          const d = await r.json();
+          btn.textContent = d.error ? 'Failed' : 'Tracked ✓';
+          if(!d.error) loadWallets();
+        }catch(e){
+          btn.textContent = 'Failed';
+        }
+      });
+    });
+  }catch(e){
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
+  }finally{
+    $('scanBtn').disabled = false;
+  }
+});
 
 $('addBtn').addEventListener('click', async ()=>{
   const address = $('addAddr').value.trim();
