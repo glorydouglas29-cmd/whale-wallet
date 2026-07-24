@@ -101,13 +101,13 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">Track a wallet</div>
+    <div class="panel-title">Find buyers among tracked wallets</div>
     <div class="add-row">
-      <input type="text" id="addAddr" placeholder="Wallet address…">
-      <input type="text" id="addLabel" placeholder="Label (optional)" style="max-width:180px;">
-      <button id="addBtn">Track</button>
+      <input type="text" id="buyersMint" placeholder="Token contract to check for buys…">
+      <button id="buyersBtn">Find buyers</button>
     </div>
-    <div class="status-line" id="addStatus"></div>
+    <div class="status-line" id="buyersStatus"></div>
+    <div id="buyersResults"></div>
   </div>
 
   <div class="panel">
@@ -292,24 +292,45 @@ $('scanBtn').addEventListener('click', async ()=>{
   }
 });
 
-$('addBtn').addEventListener('click', async ()=>{
-  const address = $('addAddr').value.trim();
-  const label = $('addLabel').value.trim();
-  const statusEl = $('addStatus');
-  if(!address){ statusEl.textContent = 'Enter a wallet address.'; statusEl.className='status-line err'; return; }
+$('buyersBtn').addEventListener('click', async ()=>{
+  const mint = $('buyersMint').value.trim();
+  const statusEl = $('buyersStatus');
+  const resultsEl = $('buyersResults');
+  resultsEl.innerHTML = '';
+  if(!mint){ statusEl.textContent = 'Enter a token contract address.'; statusEl.className='status-line err'; return; }
 
-  $('addBtn').disabled = true;
+  $('buyersBtn').disabled = true;
+  statusEl.textContent = 'Checking tracked wallets… this can take a bit for a full list.';
+  statusEl.className = 'status-line';
   try{
-    const res = await fetch('/api/wallets', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({address, label}) });
+    const res = await fetch(`/api/find-buyers?mint=${encodeURIComponent(mint)}`);
     const data = await res.json();
     if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
-    statusEl.textContent = 'Tracking started.'; statusEl.className='status-line ok';
-    $('addAddr').value=''; $('addLabel').value='';
-    loadWallets();
+
+    const results = data.results || [];
+    const priceNote = data.priceUsd != null
+      ? ` (price: $${data.priceUsd.toLocaleString(undefined,{maximumFractionDigits:6})})`
+      : ' (price unavailable — showing token amounts only)';
+    statusEl.textContent = `${results.length} of ${data.scannedWallets} tracked wallet${data.scannedWallets===1?'':'s'} bought this, based on recent swap history${priceNote}.`;
+    statusEl.className = 'status-line ok';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">None of your tracked wallets show a buy of this token recently.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>`
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${r.label || short(r.address)}</div>
+          <div class="wallet-addr">${fmtNum(r.totalBought)} tokens${r.valueUsd!=null ? ' · $'+fmtNum(r.valueUsd) : ''} · ${r.buyCount} buy${r.buyCount===1?'':'s'} · ${r.lastBuyTimestamp ? timeAgo(r.lastBuyTimestamp) : '—'}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`).join('');
   }catch(e){
-    statusEl.textContent = 'Failed to add wallet.'; statusEl.className='status-line err';
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
   }finally{
-    $('addBtn').disabled = false;
+    $('buyersBtn').disabled = false;
   }
 });
 
