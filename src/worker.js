@@ -85,8 +85,8 @@ async function saveTrades(env, trades){
 // straight from Helius instead of us having to guess from raw balance
 // deltas. Falls back to an empty array on any failure so a single bad
 // wallet/API hiccup doesn't kill the whole poll cycle for other wallets.
-async function fetchWalletHistory(address, env){
-  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=25`;
+async function fetchWalletHistory(address, env, limit = 25){
+  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=${limit}`;
   try{
     const res = await fetch(url);
     if(!res.ok){
@@ -135,6 +135,67 @@ function detectSwap(tx, address){
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
+}
+
+// Same Jupiter Price API v3 used elsewhere in the degen suite (Rekt or
+// Rich). Free lite endpoint, no key needed. Returns null on any failure so
+// a price hiccup degrades to "show token amounts only" instead of erroring
+// out the whole scan.
+async function getTokenPriceUsd(mint){
+  try{
+    const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${mint}`);
+    if(!res.ok) return null;
+    const data = await res.json();
+    return data?.[mint]?.usdPrice ?? null;
+  }catch(e){ return null; }
+}
+
+// For each tracked wallet, pulls its recent history and checks whether any
+// genuine swap (reusing the exact same detectSwap logic the poller uses,
+// so "bought" means the same thing everywhere in this app) received the
+// target mint. Deliberately does NOT count plain transfers/airdrops of the
+// token as a "buy" — only actual swaps count.
+//
+// Scope limitation worth knowing: this only looks at each wallet's most
+// recent transactions (default 50), not full history, so an old buy well
+// outside that window won't surface. Good for "did they buy this recently /
+// are they currently accumulating," not a lifetime audit.
+async function findMintBuyers(wallets, targetMint, env){
+  const priceUsd = await getTokenPriceUsd(targetMint);
+  const results = [];
+
+  for(const wallet of wallets){
+    const history = await fetchWalletHistory(wallet.address, env, 50);
+    let totalBought = 0;
+    let buyCount = 0;
+    let lastBuyTimestamp = null;
+
+    for(const tx of history){
+      if(tx.transactionError) continue;
+      const changes = detectSwap(tx, wallet.address);
+      if(!changes) continue;
+      const bought = changes.find(c => c.mint === targetMint && c.amount > 0);
+      if(bought){
+        totalBought += bought.amount;
+        buyCount += 1;
+        if(!lastBuyTimestamp || tx.timestamp > lastBuyTimestamp) lastBuyTimestamp = tx.timestamp;
+      }
+    }
+
+    if(totalBought > 0){
+      results.push({
+        address: wallet.address,
+        label: wallet.label || null,
+        totalBought,
+        valueUsd: priceUsd != null ? totalBought * priceUsd : null,
+        buyCount,
+        lastBuyTimestamp,
+      });
+    }
+  }
+
+  results.sort((a, b) => (b.valueUsd ?? b.totalBought) - (a.valueUsd ?? a.totalBought));
+  return { results, priceUsd, scannedWallets: wallets.length };
 }
 
 // Generic Solana JSON-RPC call, routed through Helius (same API key you
@@ -329,6 +390,28 @@ async function handleApi(request, env){
     await saveWallets(env, wallets);
     await env.TRACKER_KV.delete(`lastseen:${address}`);
     return json({ wallets });
+  }
+
+  if(url.pathname === '/api/find-buyers' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet." }, 500);
+    }
+    const mint = (url.searchParams.get('mint') || '').trim();
+    if(!isValidSolanaAddress(mint)) return json({ error: 'Invalid token mint address.' }, 400);
+    const wallets = await getWallets(env);
+    if(!wallets.length){
+      return json({ error: 'No tracked wallets yet — scan a token for whales and track a few first.' }, 400);
+    }
+    try{
+      const data = await findMintBuyers(wallets, mint, env);
+      return json(data);
+    }catch(e){
+      console.warn('find-buyers failed', e);
+      return json({ error: 'Failed to scan tracked wallets. Try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/trades' && request.method === 'GET'){
