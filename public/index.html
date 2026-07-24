@@ -91,6 +91,28 @@
   </header>
 
   <div class="panel">
+    <div class="panel-title">Find who deployed a token</div>
+    <div class="status-line" style="margin-bottom:10px;">Pulls the token's creation transaction and reads who paid for it — usually the deployer's wallet. Less reliable for tokens launched through a program/factory.</div>
+    <div class="add-row">
+      <input type="text" id="deployerMint" placeholder="Token contract (e.g. MAD)…">
+      <button id="deployerBtn">Find deployer</button>
+    </div>
+    <div class="status-line" id="deployerStatus"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Trace a wallet's funded burners</div>
+    <div class="status-line" style="margin-bottom:10px;">Finds wallets a known address funded directly with SOL, then checks those for a buy of the target token. Only catches on-chain funding — won't find a burner funded straight from a CEX withdrawal.</div>
+    <div class="add-row">
+      <input type="text" id="traceWallet" placeholder="Known wallet (e.g. the dev wallet)…">
+      <input type="text" id="traceTarget" placeholder="Token to check for…">
+      <button id="traceBtn">Trace</button>
+    </div>
+    <div class="status-line" id="traceStatus"></div>
+    <div id="traceResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Cross-check two tokens</div>
     <div class="status-line" style="margin-bottom:10px;">Find token A's whales, then check which of them also bought token B. Nothing gets saved — one-shot lookup.</div>
     <div class="add-row">
@@ -301,6 +323,79 @@ $('scanBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
   }finally{
     $('scanBtn').disabled = false;
+  }
+});
+
+$('deployerBtn').addEventListener('click', async ()=>{
+  const mint = $('deployerMint').value.trim();
+  const statusEl = $('deployerStatus');
+  if(!mint){ statusEl.textContent = 'Enter a token contract address.'; statusEl.className='status-line err'; return; }
+
+  $('deployerBtn').disabled = true;
+  statusEl.textContent = 'Looking up the creation transaction…';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/find-deployer?mint=${encodeURIComponent(mint)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const when = data.timestamp ? timeAgo(data.timestamp) : 'unknown time';
+    statusEl.innerHTML = `Likely deployer: <strong>${data.deployer}</strong> (paid for creation, ${when}).
+      <a class="trade-link" href="https://solscan.io/account/${data.deployer}" target="_blank" rel="noopener">view ↗</a>`;
+    statusEl.className = 'status-line ok';
+    $('traceWallet').value = data.deployer;
+  }catch(e){
+    statusEl.textContent = 'Lookup failed.'; statusEl.className='status-line err';
+  }finally{
+    $('deployerBtn').disabled = false;
+  }
+});
+
+$('traceBtn').addEventListener('click', async ()=>{
+  const wallet = $('traceWallet').value.trim();
+  const target = $('traceTarget').value.trim();
+  const statusEl = $('traceStatus');
+  const resultsEl = $('traceResults');
+  resultsEl.innerHTML = '';
+  if(!wallet || !target){ statusEl.textContent = 'Enter both the known wallet and the target token.'; statusEl.className='status-line err'; return; }
+
+  $('traceBtn').disabled = true;
+  statusEl.textContent = 'Checking who this wallet funded, then scanning each for buys…';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/trace-funder?wallet=${encodeURIComponent(wallet)}&target=${encodeURIComponent(target)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const results = data.results || [];
+    if(!data.candidateCount){
+      statusEl.textContent = 'No directly-funded wallets found in this wallet\'s recent history — nothing to check.';
+      statusEl.className = 'status-line err';
+      return;
+    }
+    const priceNote = data.priceUsd != null
+      ? ` (price: $${data.priceUsd.toLocaleString(undefined,{maximumFractionDigits:6})})`
+      : ' (price unavailable — showing token amounts only)';
+    statusEl.textContent = `${results.length} of ${data.candidateCount} funded wallet${data.candidateCount===1?'':'s'} bought the target token${priceNote}.`;
+    statusEl.className = 'status-line ok';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">Found ${data.candidateCount} wallet${data.candidateCount===1?'':'s'} this address funded, but none show a buy of the target token. It may have been funded a different way (e.g. straight from an exchange).</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>`
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(r.address)}${r.fundedSol!=null ? ' · funded with '+fmtNum(r.fundedSol)+' SOL' : ''}</div>
+          <div class="wallet-addr">${fmtNum(r.totalBought)} tokens${r.valueUsd!=null ? ' · $'+fmtNum(r.valueUsd) : ''} · ${r.buyCount} buy${r.buyCount===1?'':'s'} · ${r.lastBuyTimestamp ? timeAgo(r.lastBuyTimestamp) : '—'}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`).join('');
+  }catch(e){
+    statusEl.textContent = 'Trace failed.'; statusEl.className='status-line err';
+  }finally{
+    $('traceBtn').disabled = false;
   }
 });
 
