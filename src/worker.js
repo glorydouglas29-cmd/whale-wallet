@@ -132,6 +132,26 @@ function detectSwap(tx, address){
   return null;
 }
 
+// One-shot version of the whale-scan + buyer-check combo: finds token A's
+// top holders (already filtered to real wallets, not pools/programs), then
+// checks each one for genuine swap-buys of token B. Nothing gets saved —
+// no tracking, no KV — this is purely "who overlaps" on demand.
+async function scanCrossBuyers(sourceMint, targetMint, env){
+  const { holders } = await scanTokenHolders(sourceMint, env);
+  const whales = holders.filter(h => h.type === 'wallet');
+  if(!whales.length) return { results: [], scannedWallets: 0, priceUsd: null };
+
+  const wallets = whales.map(h => ({ address: h.address, label: null }));
+  const { results, priceUsd } = await findMintBuyers(wallets, targetMint, env);
+
+  // Attach each match's % holding of the source token too, for context —
+  // e.g. "this wallet holds 3.2% of MAD and also bought 400 BOP."
+  const pctBySource = Object.fromEntries(whales.map(h => [h.address, h.pctSupply]));
+  const enriched = results.map(r => ({ ...r, sourcePctSupply: pctBySource[r.address] ?? null }));
+
+  return { results: enriched, scannedWallets: wallets.length, priceUsd };
+}
+
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
@@ -333,6 +353,26 @@ async function handleApi(request, env){
       heliusConfigured: !!env.HELIUS_API_KEY,
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
     });
+  }
+
+  if(url.pathname === '/api/cross-scan' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const sourceMint = (url.searchParams.get('source') || '').trim();
+    const targetMint = (url.searchParams.get('target') || '').trim();
+    if(!isValidSolanaAddress(sourceMint)) return json({ error: 'Invalid token A (source) address.' }, 400);
+    if(!isValidSolanaAddress(targetMint)) return json({ error: 'Invalid token B (target) address.' }, 400);
+    try{
+      const data = await scanCrossBuyers(sourceMint, targetMint, env);
+      return json(data);
+    }catch(e){
+      console.warn('cross-scan failed', e);
+      return json({ error: 'Scan failed. Double-check both addresses and try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/scan-token' && request.method === 'GET'){
