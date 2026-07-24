@@ -91,6 +91,18 @@
   </header>
 
   <div class="panel">
+    <div class="panel-title">Cross-check two tokens</div>
+    <div class="status-line" style="margin-bottom:10px;">Find token A's whales, then check which of them also bought token B. Nothing gets saved — one-shot lookup.</div>
+    <div class="add-row">
+      <input type="text" id="crossSource" placeholder="Token A (e.g. MAD)…">
+      <input type="text" id="crossTarget" placeholder="Token B (e.g. BOP)…">
+      <button id="crossBtn">Find crossover</button>
+    </div>
+    <div class="status-line" id="crossStatus"></div>
+    <div id="crossResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Scan a token for whales</div>
     <div class="add-row">
       <input type="text" id="scanMint" placeholder="Token contract / mint address…">
@@ -289,6 +301,49 @@ $('scanBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
   }finally{
     $('scanBtn').disabled = false;
+  }
+});
+
+$('crossBtn').addEventListener('click', async ()=>{
+  const source = $('crossSource').value.trim();
+  const target = $('crossTarget').value.trim();
+  const statusEl = $('crossStatus');
+  const resultsEl = $('crossResults');
+  resultsEl.innerHTML = '';
+  if(!source || !target){ statusEl.textContent = 'Enter both token addresses.'; statusEl.className='status-line err'; return; }
+
+  $('crossBtn').disabled = true;
+  statusEl.textContent = 'Scanning whales, then checking each for buys… this can take a bit.';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/cross-scan?source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const results = data.results || [];
+    const priceNote = data.priceUsd != null
+      ? ` (price: $${data.priceUsd.toLocaleString(undefined,{maximumFractionDigits:6})})`
+      : ' (price unavailable — showing token amounts only)';
+    statusEl.textContent = `${results.length} of ${data.scannedWallets} token A whale${data.scannedWallets===1?'':'s'} also bought token B, based on recent swap history${priceNote}.`;
+    statusEl.className = 'status-line ok';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">None of token A's whales show a recent buy of token B.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>`
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(r.address)}${r.sourcePctSupply!=null ? ' · '+r.sourcePctSupply.toFixed(2)+'% of A' : ''}</div>
+          <div class="wallet-addr">${fmtNum(r.totalBought)} of B${r.valueUsd!=null ? ' · $'+fmtNum(r.valueUsd) : ''} · ${r.buyCount} buy${r.buyCount===1?'':'s'} · ${r.lastBuyTimestamp ? timeAgo(r.lastBuyTimestamp) : '—'}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`).join('');
+  }catch(e){
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
+  }finally{
+    $('crossBtn').disabled = false;
   }
 });
 
