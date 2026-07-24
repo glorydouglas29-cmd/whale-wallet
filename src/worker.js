@@ -152,6 +152,76 @@ async function scanCrossBuyers(sourceMint, targetMint, env){
   return { results: enriched, scannedWallets: wallets.length, priceUsd };
 }
 
+// Looks at a wallet's own recent outgoing SOL transfers and finds other
+// addresses it directly funded — the common pattern when someone spins up
+// a fresh "burner" wallet: move some SOL over from the known wallet first,
+// then trade from the burner. Filters out dust (default 0.05 SOL) since
+// real funding-for-trading transfers are rarely that small, and caps the
+// candidate list so the follow-up scan stays bounded.
+async function findFundedWallets(devWallet, env, { historyLimit = 100, minSol = 0.05, maxCandidates = 20 } = {}){
+  const history = await fetchWalletHistory(devWallet, env, historyLimit);
+  const funded = {};
+  for(const tx of history){
+    if(tx.transactionError) continue;
+    for(const nt of tx.nativeTransfers || []){
+      if(nt.fromUserAccount !== devWallet || !nt.toUserAccount || nt.toUserAccount === devWallet) continue;
+      const sol = nt.amount / 1e9;
+      if(sol < minSol) continue;
+      if(!funded[nt.toUserAccount]){
+        funded[nt.toUserAccount] = { totalSol: 0, firstSeen: tx.timestamp, lastSeen: tx.timestamp, transfers: 0 };
+      }
+      const f = funded[nt.toUserAccount];
+      f.totalSol += sol;
+      f.transfers += 1;
+      f.firstSeen = Math.min(f.firstSeen, tx.timestamp);
+      f.lastSeen = Math.max(f.lastSeen, tx.timestamp);
+    }
+  }
+  return Object.entries(funded)
+    .map(([address, info]) => ({ address, ...info }))
+    .sort((a, b) => b.totalSol - a.totalSol)
+    .slice(0, maxCandidates);
+}
+
+// Combines the funding trace above with the same buy-detection used
+// elsewhere: find wallets the known address funded directly, then check
+// each for a genuine swap-buy of the target token. Only catches on-chain
+// funding — if the burner was funded from a CEX withdrawal instead, there's
+// no link to trace and this will come back empty.
+async function traceFunderBuyers(devWallet, targetMint, env){
+  const candidates = await findFundedWallets(devWallet, env);
+  if(!candidates.length) return { results: [], candidateCount: 0, priceUsd: null };
+
+  const wallets = candidates.map(c => ({ address: c.address, label: null }));
+  const { results, priceUsd } = await findMintBuyers(wallets, targetMint, env);
+
+  const fundedInfo = Object.fromEntries(candidates.map(c => [c.address, c]));
+  const enriched = results.map(r => ({
+    ...r,
+    fundedSol: fundedInfo[r.address]?.totalSol ?? null,
+    fundedAt: fundedInfo[r.address]?.firstSeen ?? null,
+  }));
+
+  return { results: enriched, candidateCount: candidates.length, priceUsd };
+}
+
+// A token's creation transaction is public — pulling the mint address's
+// very first transaction and reading who paid for it identifies the
+// deployer in most cases, especially pump.fun-style launches where the
+// creator wallet signs the creation tx directly. Less reliable for tokens
+// launched through a program/factory, where the fee payer might be a
+// deployer *contract* rather than a person's wallet — worth sanity-checking
+// the result against what you already know about the project.
+async function findTokenDeployer(mint, env){
+  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?api-key=${env.HELIUS_API_KEY}&limit=1&sort-order=asc`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`Deployer lookup failed: ${res.status}`);
+  const data = await res.json();
+  const tx = Array.isArray(data) ? data[0] : null;
+  if(!tx) return { deployer: null, signature: null, timestamp: null };
+  return { deployer: tx.feePayer || null, signature: tx.signature || null, timestamp: tx.timestamp || null };
+}
+
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
@@ -353,6 +423,45 @@ async function handleApi(request, env){
       heliusConfigured: !!env.HELIUS_API_KEY,
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
     });
+  }
+
+  if(url.pathname === '/api/find-deployer' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const mint = (url.searchParams.get('mint') || '').trim();
+    if(!isValidSolanaAddress(mint)) return json({ error: 'Invalid token mint address.' }, 400);
+    try{
+      const data = await findTokenDeployer(mint, env);
+      if(!data.deployer) return json({ error: "Couldn't find a creation transaction for this mint." }, 404);
+      return json(data);
+    }catch(e){
+      console.warn('find-deployer failed', e);
+      return json({ error: 'Lookup failed. Double-check the mint address and try again.' }, 500);
+    }
+  }
+
+  if(url.pathname === '/api/trace-funder' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const wallet = (url.searchParams.get('wallet') || '').trim();
+    const target = (url.searchParams.get('target') || '').trim();
+    if(!isValidSolanaAddress(wallet)) return json({ error: 'Invalid wallet address.' }, 400);
+    if(!isValidSolanaAddress(target)) return json({ error: 'Invalid target token address.' }, 400);
+    try{
+      const data = await traceFunderBuyers(wallet, target, env);
+      return json(data);
+    }catch(e){
+      console.warn('trace-funder failed', e);
+      return json({ error: 'Trace failed. Double-check both addresses and try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/cross-scan' && request.method === 'GET'){
