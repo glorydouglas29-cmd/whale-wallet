@@ -15,9 +15,22 @@
 // This is a genuinely separate deployed project from ZEKE LEDGER, so it
 // needs its own copies of these — nothing is shared between the two Workers
 // at runtime.
+//
+// NOTE: uses Helius's current v0/addresses/{address}/transactions endpoint
+// (not the old v1/wallet/history path, which is on the deprecated Enhanced
+// Transactions API). This one returns a `type` field per tx (SWAP, TRANSFER,
+// etc.) straight from Helius, so swap detection trusts that first and only
+// falls back to a "moved 2+ assets" heuristic for unclassified txs.
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MAX_TRADES_STORED = 200;
+const MAX_TRACKED_WALLETS = 25; // keeps Helius usage + poll time bounded
+const RATE_LIMIT_WINDOW_SEC = 60;
+const RATE_LIMIT_MAX_REQUESTS = 10; // per IP, per window, for wallet add/remove
+const SYSTEM_PROGRAM_ID = '1'.repeat(32); // owner of every real (non-PDA) wallet account
+const BURN_ADDRESSES = new Set([
+  '1nc1nerator11111111111111111111111111111111', // Solana's known incinerator/burn address
+]);
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -36,6 +49,21 @@ function isValidSolanaAddress(addr){
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
 }
 
+// Lightweight per-IP rate limit for the wallet-add/remove endpoints, since
+// those are the only ones that mutate state or could be spammed. Uses a
+// single KV counter per IP per time window rather than a sliding log, since
+// this only needs to stop abuse, not be precise.
+async function checkRateLimit(request, env){
+  if(!env.TRACKER_KV) return true; // fail open if KV isn't set up yet
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const windowId = Math.floor(Date.now() / 1000 / RATE_LIMIT_WINDOW_SEC);
+  const key = `ratelimit:${ip}:${windowId}`;
+  const current = parseInt(await env.TRACKER_KV.get(key) || '0', 10);
+  if(current >= RATE_LIMIT_MAX_REQUESTS) return false;
+  await env.TRACKER_KV.put(key, String(current + 1), { expirationTtl: RATE_LIMIT_WINDOW_SEC * 2 });
+  return true;
+}
+
 async function getWallets(env){
   const raw = await env.TRACKER_KV.get('wallets');
   return raw ? JSON.parse(raw) : [];
@@ -51,25 +79,125 @@ async function saveTrades(env, trades){
   await env.TRACKER_KV.put('trades', JSON.stringify(trades.slice(0, MAX_TRADES_STORED)));
 }
 
+// Helius's old v1/wallet/history endpoint (Enhanced Transactions API) is
+// deprecated. The current recommended path is the parsed-transactions
+// endpoint below, which returns a `type` field (SWAP, TRANSFER, etc.)
+// straight from Helius instead of us having to guess from raw balance
+// deltas. Falls back to an empty array on any failure so a single bad
+// wallet/API hiccup doesn't kill the whole poll cycle for other wallets.
 async function fetchWalletHistory(address, env){
-  const url = `https://api.helius.xyz/v1/wallet/${address}/history?api-key=${env.HELIUS_API_KEY}&limit=25`;
-  const res = await fetch(url);
-  if(!res.ok) return [];
-  const data = await res.json();
-  return data.data || [];
+  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=25`;
+  try{
+    const res = await fetch(url);
+    if(!res.ok){
+      console.warn(`Helius history fetch failed for ${address}: ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  }catch(e){
+    console.warn(`Helius history fetch threw for ${address}:`, e);
+    return [];
+  }
 }
 
-// Same heuristic used in ZEKE LEDGER: a swap moves at least two different
-// assets in one transaction (e.g. -SOL, +TOKEN). Simple, reused on purpose
-// rather than trusting an upstream "type" label.
-function detectSwap(tx){
-  const changes = (tx.balanceChanges || []).filter(c => Math.abs(c.amount) > 0);
-  return changes.length >= 2 ? changes : null;
+// Reduces a parsed transaction's tokenTransfers + nativeTransfers down to
+// this wallet's net change per mint (e.g. -1.2 SOL, +48000 MAD). Merges
+// multiple transfers of the same mint within one tx into a single line.
+function walletChanges(tx, address){
+  const totals = {};
+  for(const nt of tx.nativeTransfers || []){
+    if(nt.fromUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) - nt.amount / 1e9;
+    if(nt.toUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) + nt.amount / 1e9;
+  }
+  for(const tt of tx.tokenTransfers || []){
+    const mint = tt.mint;
+    if(!mint) continue;
+    if(tt.fromUserAccount === address) totals[mint] = (totals[mint]||0) - tt.tokenAmount;
+    if(tt.toUserAccount === address) totals[mint] = (totals[mint]||0) + tt.tokenAmount;
+  }
+  return Object.entries(totals)
+    .filter(([, amount]) => Math.abs(amount) > 0.000001)
+    .map(([mint, amount]) => ({ mint, amount }));
+}
+
+// Trust Helius's own `type` classification first (SWAP is set for Jupiter,
+// Raydium, Pump.fun, etc.). Fall back to the "moved 2+ assets" heuristic
+// only for transactions Helius didn't classify, so a custom/unlisted AMM
+// program doesn't get silently dropped from the feed.
+function detectSwap(tx, address){
+  const changes = walletChanges(tx, address);
+  if(tx.type === 'SWAP') return changes.length ? changes : null;
+  if(!tx.type || tx.type === 'UNKNOWN') return changes.length >= 2 ? changes : null;
+  return null;
 }
 
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
+}
+
+// Generic Solana JSON-RPC call, routed through Helius (same API key you
+// already use for transaction history — no separate RPC provider needed).
+async function rpcCall(env, method, params){
+  const url = `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  if(!res.ok) throw new Error(`RPC ${method} failed: ${res.status}`);
+  const data = await res.json();
+  if(data.error) throw new Error(`RPC ${method} error: ${data.error.message || 'unknown'}`);
+  return data.result;
+}
+
+// Given a token mint, finds its top ~20 holder accounts and classifies each
+// as a real wallet vs. a program-controlled account (LP pool, staking
+// vault, PDA, etc.) so the UI can show actual whales instead of a list
+// that's mostly Raydium/Pump.fun pool addresses.
+//
+// The classification trick: every ordinary wallet's on-chain account is
+// owned by the System Program. Pool vaults, staking accounts, and other
+// PDAs are owned by whatever program created them. Checking that one field
+// is enough to tell "trader" from "infrastructure" without guessing.
+async function scanTokenHolders(mint, env){
+  const largest = await rpcCall(env, 'getTokenLargestAccounts', [mint]);
+  const tokenAccounts = (largest?.value || []).filter(a => Number(a.amount) > 0);
+  if(!tokenAccounts.length) return { holders: [], totalSupply: 0 };
+
+  // Resolve each top token account to the wallet/PDA that actually owns it.
+  const accountInfos = await rpcCall(env, 'getMultipleAccounts', [
+    tokenAccounts.map(a => a.address),
+    { encoding: 'jsonParsed' },
+  ]);
+  const owned = tokenAccounts.map((acc, i) => {
+    const parsed = accountInfos?.value?.[i]?.data?.parsed?.info;
+    return { owner: parsed?.owner || null, amount: Number(acc.uiAmount) };
+  }).filter(o => o.owner);
+
+  const supplyResult = await rpcCall(env, 'getTokenSupply', [mint]);
+  const totalSupply = Number(supplyResult?.value?.uiAmount || 0);
+
+  // One batched call to check what kind of account each unique owner is.
+  const uniqueOwners = [...new Set(owned.map(o => o.owner))];
+  const ownerInfos = await rpcCall(env, 'getMultipleAccounts', [uniqueOwners, { encoding: 'base64' }]);
+  const ownerType = {};
+  uniqueOwners.forEach((addr, i) => {
+    const info = ownerInfos?.value?.[i];
+    ownerType[addr] = info && info.owner === SYSTEM_PROGRAM_ID ? 'wallet' : 'program';
+  });
+
+  const holders = owned
+    .map(o => ({
+      address: o.owner,
+      amount: o.amount,
+      pctSupply: totalSupply > 0 ? (o.amount / totalSupply) * 100 : 0,
+      type: BURN_ADDRESSES.has(o.owner) ? 'burn' : (ownerType[o.owner] || 'unknown'),
+    }))
+    .sort((a, b) => b.amount - a.amount);
+
+  return { holders, totalSupply };
 }
 
 async function sendDiscordAlert(env, wallet, tx, changes){
@@ -115,8 +243,8 @@ async function pollWallets(env){
     if(lastSeenSig){
       newTxs.reverse(); // oldest-first, so log/alerts land in chronological order
       for(const tx of newTxs){
-        if(tx.error) continue;
-        const changes = detectSwap(tx);
+        if(tx.transactionError) continue;
+        const changes = detectSwap(tx, wallet.address);
         if(!changes) continue;
         trades.unshift({
           wallet: wallet.address,
@@ -146,6 +274,24 @@ async function handleApi(request, env){
     });
   }
 
+  if(url.pathname === '/api/scan-token' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const mint = (url.searchParams.get('mint') || '').trim();
+    if(!isValidSolanaAddress(mint)) return json({ error: 'Invalid token mint address.' }, 400);
+    try{
+      const { holders, totalSupply } = await scanTokenHolders(mint, env);
+      return json({ holders, totalSupply });
+    }catch(e){
+      console.warn('Token scan failed', e);
+      return json({ error: 'Failed to scan this token. Double-check the mint address and try again.' }, 500);
+    }
+  }
+
   if(!env.TRACKER_KV){
     return json({ error: "TRACKER_KV binding isn't set up yet. Add a KV namespace binding named TRACKER_KV in this Worker's Settings -> Bindings." }, 500);
   }
@@ -155,18 +301,27 @@ async function handleApi(request, env){
   }
 
   if(url.pathname === '/api/wallets' && request.method === 'POST'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
     const body = await request.json().catch(()=>({}));
     const address = (body.address||'').trim();
     const label = (body.label||'').trim().slice(0, 40);
     if(!isValidSolanaAddress(address)) return json({ error: 'Invalid Solana address.' }, 400);
     const wallets = await getWallets(env);
     if(wallets.some(w=>w.address===address)) return json({ error: 'Already tracked.' }, 400);
+    if(wallets.length >= MAX_TRACKED_WALLETS){
+      return json({ error: `Limit of ${MAX_TRACKED_WALLETS} tracked wallets reached. Remove one first.` }, 400);
+    }
     wallets.unshift({ address, label: label || null, addedAt: Date.now() });
     await saveWallets(env, wallets);
     return json({ wallets });
   }
 
   if(url.pathname === '/api/wallets' && request.method === 'DELETE'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
     const body = await request.json().catch(()=>({}));
     const address = (body.address||'').trim();
     let wallets = await getWallets(env);
@@ -181,6 +336,9 @@ async function handleApi(request, env){
   }
 
   if(url.pathname === '/api/poll-now' && request.method === 'POST'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
     // Manual trigger, mainly for testing without waiting up to 5 minutes
     // for the next scheduled run.
     await pollWallets(env);
