@@ -89,6 +89,27 @@
   .discord-dot{width:8px; height:8px; border-radius:50%; background:var(--muted);}
   .discord-dot.set{background:var(--up); box-shadow:0 0 8px var(--up);}
 
+  code{
+    background:var(--surface-2); border:1px solid var(--line); color:var(--ink);
+    font-family:'JetBrains Mono',monospace; font-size:11px; padding:1px 5px; border-radius:4px;
+    word-break:break-all;
+  }
+  .setup-steps{
+    list-style:none; counter-reset:step; margin-top:6px;
+  }
+  .setup-steps li{
+    counter-increment:step; position:relative; padding:8px 0 8px 30px;
+    font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--muted); line-height:1.5;
+    border-top:1px solid var(--line);
+  }
+  .setup-steps li:first-child{border-top:none;}
+  .setup-steps li::before{
+    content:counter(step); position:absolute; left:0; top:8px;
+    width:18px; height:18px; border-radius:50%; background:var(--surface-2); border:1px solid var(--ink-dim);
+    color:var(--ink); font-size:10px; display:flex; align-items:center; justify-content:center;
+  }
+  .setup-steps strong{color:var(--paper); font-weight:600;}
+
   footer{margin-top:36px; font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--muted); text-align:center;}
 
   @media(max-width:560px){
@@ -173,6 +194,16 @@
   <div class="tab-panel" id="tab-tracked">
 
   <div class="panel">
+    <div class="panel-title">Track a wallet</div>
+    <div class="add-row">
+      <input type="text" id="addAddr" placeholder="Wallet address…">
+      <input type="text" id="addLabel" placeholder="Label (optional)" style="max-width:180px;">
+      <button id="addBtn">Track</button>
+    </div>
+    <div class="status-line" id="addStatus"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Tracked wallets</div>
     <div id="walletList"><div class="empty">Loading…</div></div>
   </div>
@@ -207,12 +238,21 @@
       <span class="discord-dot" id="discordDot"></span>
       <span class="status-line" id="discordStatus" style="margin:0;">Checking…</span>
     </div>
-    <div class="status-line" style="margin-bottom:14px;">Set <code>DISCORD_WEBHOOK_URL</code> as a secret to enable Discord alerts. Optional — the dashboard works fine without it.</div>
+    <div class="status-line" style="margin-bottom:18px;">Set <code>DISCORD_WEBHOOK_URL</code> as a secret to enable Discord alerts. Optional — the dashboard works fine without it.</div>
+
     <div class="discord-status">
       <span class="discord-dot" id="telegramDot"></span>
       <span class="status-line" id="telegramStatus" style="margin:0;">Checking…</span>
     </div>
-    <div class="status-line">Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> as secrets to enable Telegram alerts. Create a bot via @BotFather, then message it once and check <code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> to find your chat ID (or use a helper bot like @userinfobot).</div>
+    <div class="status-line" style="margin-bottom:8px;">Set up Telegram alerts (free, takes about 2 minutes):</div>
+    <ol class="setup-steps">
+      <li>Open Telegram, search for <strong>@BotFather</strong>, and start a chat with it.</li>
+      <li>Send <code>/newbot</code> and follow the prompts (any name works). BotFather replies with a <strong>bot token</strong> — copy it.</li>
+      <li>Search for your new bot by the username you gave it, open it, and send it any message (e.g. "hi").</li>
+      <li>Find your <strong>chat ID</strong> one of two ways: message <strong>@userinfobot</strong> and it replies with your ID directly, or visit <code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> in a browser and look for <code>"chat":{"id":...}</code> in the response.</li>
+      <li>In this Worker's dashboard: Settings → Variables and Secrets → add <code>TELEGRAM_BOT_TOKEN</code> (from step 2) and <code>TELEGRAM_CHAT_ID</code> (from step 4), both as secrets.</li>
+      <li>Redeploy. The dot above turns green once it's recognized.</li>
+    </ol>
   </div>
 
   </div>
@@ -337,6 +377,27 @@ async function loadDiscordStatus(){
     $('telegramStatus').textContent = 'Could not check status.';
   }
 }
+
+$('addBtn').addEventListener('click', async ()=>{
+  const address = $('addAddr').value.trim();
+  const label = $('addLabel').value.trim();
+  const statusEl = $('addStatus');
+  if(!address){ statusEl.textContent = 'Enter a wallet address.'; statusEl.className='status-line err'; return; }
+
+  $('addBtn').disabled = true;
+  try{
+    const res = await fetch('/api/wallets', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({address, label}) });
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+    statusEl.textContent = 'Tracking started.'; statusEl.className='status-line ok';
+    $('addAddr').value=''; $('addLabel').value='';
+    loadWallets();
+  }catch(e){
+    statusEl.textContent = 'Failed to add wallet.'; statusEl.className='status-line err';
+  }finally{
+    $('addBtn').disabled = false;
+  }
+});
 
 $('scanBtn').addEventListener('click', async ()=>{
   const mint = $('scanMint').value.trim();
