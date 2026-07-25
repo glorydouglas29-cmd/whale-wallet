@@ -101,11 +101,17 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">Trace a wallet's funded burners</div>
-    <div class="status-line" style="margin-bottom:10px;">Finds wallets a known address funded directly with SOL, then checks those for a buy of the target token. Only catches on-chain funding — won't find a burner funded straight from a CEX withdrawal.</div>
+    <div class="panel-title">Trace a wallet's funding lineage</div>
+    <div class="status-line" style="margin-bottom:10px;">Follows who a known wallet funded, who those wallets funded, and so on — checking every wallet along the way for a buy of the target token. Only catches on-chain funding — won't find a burner funded straight from a CEX withdrawal.</div>
     <div class="add-row">
       <input type="text" id="traceWallet" placeholder="Known wallet (e.g. the dev wallet)…">
       <input type="text" id="traceTarget" placeholder="Token to check for…">
+      <select id="traceHops" style="background:var(--surface-2); border:1px solid var(--line); color:var(--paper); font-family:'JetBrains Mono',monospace; font-size:13px; padding:11px 13px; border-radius:7px;">
+        <option value="1">1 hop</option>
+        <option value="2" selected>2 hops</option>
+        <option value="3">3 hops</option>
+        <option value="4">4 hops</option>
+      </select>
       <button id="traceBtn">Trace</button>
     </div>
     <div class="status-line" id="traceStatus"></div>
@@ -150,12 +156,17 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">Discord alerts</div>
+    <div class="panel-title">Alert channels</div>
     <div class="discord-status">
       <span class="discord-dot" id="discordDot"></span>
       <span class="status-line" id="discordStatus" style="margin:0;">Checking…</span>
     </div>
-    <div class="status-line">Set <code>DISCORD_WEBHOOK_URL</code> as a secret in this Worker's settings to enable alerts. The dashboard still works without it — this only affects push notifications.</div>
+    <div class="status-line" style="margin-bottom:14px;">Set <code>DISCORD_WEBHOOK_URL</code> as a secret to enable Discord alerts. Optional — the dashboard works fine without it.</div>
+    <div class="discord-status">
+      <span class="discord-dot" id="telegramDot"></span>
+      <span class="status-line" id="telegramStatus" style="margin:0;">Checking…</span>
+    </div>
+    <div class="status-line">Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code> as secrets to enable Telegram alerts. Create a bot via @BotFather, then message it once and check <code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> to find your chat ID (or use a helper bot like @userinfobot).</div>
   </div>
 
   <div class="panel">
@@ -248,22 +259,34 @@ async function loadDiscordStatus(){
   try{
     const res = await fetch('/api/status');
     const data = await res.json();
+
     if(!data.kvConfigured){
       $('discordStatus').textContent = 'KV namespace not set up yet — see Worker Settings → Bindings.';
+      $('telegramStatus').textContent = 'KV namespace not set up yet — see Worker Settings → Bindings.';
       return;
     }
     if(!data.heliusConfigured){
       $('discordStatus').textContent = 'HELIUS_API_KEY not set yet — polling won\'t work until it is.';
+      $('telegramStatus').textContent = 'HELIUS_API_KEY not set yet — polling won\'t work until it is.';
       return;
     }
+
     if(data.discordConfigured){
       $('discordDot').classList.add('set');
       $('discordStatus').textContent = 'Discord webhook is configured — alerts are active.';
     } else {
-      $('discordStatus').textContent = 'Not set yet — the dashboard still works, you just won\'t get Discord pings.';
+      $('discordStatus').textContent = 'Not set yet — you just won\'t get Discord pings.';
+    }
+
+    if(data.telegramConfigured){
+      $('telegramDot').classList.add('set');
+      $('telegramStatus').textContent = 'Telegram bot is configured — alerts are active.';
+    } else {
+      $('telegramStatus').textContent = 'Not set yet — you just won\'t get Telegram pings.';
     }
   }catch(e){
     $('discordStatus').textContent = 'Could not check status.';
+    $('telegramStatus').textContent = 'Could not check status.';
   }
 }
 
@@ -354,40 +377,37 @@ $('deployerBtn').addEventListener('click', async ()=>{
 $('traceBtn').addEventListener('click', async ()=>{
   const wallet = $('traceWallet').value.trim();
   const target = $('traceTarget').value.trim();
+  const hops = $('traceHops').value;
   const statusEl = $('traceStatus');
   const resultsEl = $('traceResults');
   resultsEl.innerHTML = '';
   if(!wallet || !target){ statusEl.textContent = 'Enter both the known wallet and the target token.'; statusEl.className='status-line err'; return; }
 
   $('traceBtn').disabled = true;
-  statusEl.textContent = 'Checking who this wallet funded, then scanning each for buys…';
+  statusEl.textContent = `Following the funding chain ${hops} hop${hops==='1'?'':'s'} out, checking every wallet along the way… this can take a bit.`;
   statusEl.className = 'status-line';
   try{
-    const res = await fetch(`/api/trace-funder?wallet=${encodeURIComponent(wallet)}&target=${encodeURIComponent(target)}`);
+    const res = await fetch(`/api/trace-lineage?wallet=${encodeURIComponent(wallet)}&target=${encodeURIComponent(target)}&hops=${encodeURIComponent(hops)}`);
     const data = await res.json();
     if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
 
     const results = data.results || [];
-    if(!data.candidateCount){
-      statusEl.textContent = 'No directly-funded wallets found in this wallet\'s recent history — nothing to check.';
-      statusEl.className = 'status-line err';
-      return;
-    }
     const priceNote = data.priceUsd != null
       ? ` (price: $${data.priceUsd.toLocaleString(undefined,{maximumFractionDigits:6})})`
       : ' (price unavailable — showing token amounts only)';
-    statusEl.textContent = `${results.length} of ${data.candidateCount} funded wallet${data.candidateCount===1?'':'s'} bought the target token${priceNote}.`;
-    statusEl.className = 'status-line ok';
+    const capNote = data.truncated ? ' Hit the scan cap — results may be incomplete; narrow the hops or try again.' : '';
+    statusEl.textContent = `Checked ${data.scannedWallets} wallet${data.scannedWallets===1?'':'s'} across the chain, found ${results.length} buyer${results.length===1?'':'s'}${priceNote}.${capNote}`;
+    statusEl.className = results.length ? 'status-line ok' : 'status-line err';
 
     if(!results.length){
-      resultsEl.innerHTML = `<div class="empty">Found ${data.candidateCount} wallet${data.candidateCount===1?'':'s'} this address funded, but none show a buy of the target token. It may have been funded a different way (e.g. straight from an exchange).</div>`;
+      resultsEl.innerHTML = `<div class="empty">No wallet in this funding chain shows a buy of the target token within this depth. It may have been funded a different way (e.g. straight from an exchange), or be further out than ${hops} hop${hops==='1'?'':'s'}.</div>`;
       return;
     }
 
     resultsEl.innerHTML = results.map(r=>`
       <div class="wallet-row">
         <div>
-          <div class="wallet-name">${short(r.address)}${r.fundedSol!=null ? ' · funded with '+fmtNum(r.fundedSol)+' SOL' : ''}</div>
+          <div class="wallet-name">${short(r.address)} · ${r.depth} hop${r.depth===1?'':'s'} out${r.fundedBy ? ' · funded by '+short(r.fundedBy) : ''}</div>
           <div class="wallet-addr">${fmtNum(r.totalBought)} tokens${r.valueUsd!=null ? ' · $'+fmtNum(r.valueUsd) : ''} · ${r.buyCount} buy${r.buyCount===1?'':'s'} · ${r.lastBuyTimestamp ? timeAgo(r.lastBuyTimestamp) : '—'}</div>
         </div>
         <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
