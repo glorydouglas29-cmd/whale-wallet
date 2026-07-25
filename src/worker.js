@@ -5,6 +5,11 @@
 // wallet's recent activity via Helius, detect swaps, log them for the
 // dashboard feed, and push a Discord alert for each new one.
 //
+// Also includes a set of on-demand investigation tools that don't touch KV
+// at all — whale scanning, cross-token buyer checks, deployer lookup, and
+// multi-hop funding-lineage tracing — for finding wallets worth tracking in
+// the first place.
+//
 // REQUIRED SETUP after first deploy (same pattern as ZEKE LEDGER):
 // 1. Settings -> Bindings -> add a KV namespace, binding name: TRACKER_KV
 // 2. Settings -> Variables and Secrets -> add HELIUS_API_KEY (secret)
@@ -21,6 +26,10 @@
 // Transactions API). This one returns a `type` field per tx (SWAP, TRANSFER,
 // etc.) straight from Helius, so swap detection trusts that first and only
 // falls back to a "moved 2+ assets" heuristic for unclassified txs.
+//
+// IMPORTANT — wrangler.jsonc must declare kv_namespaces for TRACKER_KV.
+// Bindings added only through the dashboard get wiped on every Git-triggered
+// deploy, since Cloudflare treats wrangler.jsonc as the source of truth.
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MAX_TRADES_STORED = 200;
@@ -49,12 +58,12 @@ function isValidSolanaAddress(addr){
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
 }
 
-// Lightweight per-IP rate limit for the wallet-add/remove endpoints, since
-// those are the only ones that mutate state or could be spammed. Uses a
-// single KV counter per IP per time window rather than a sliding log, since
-// this only needs to stop abuse, not be precise.
+// Lightweight per-IP rate limit for endpoints that mutate state or could be
+// spammed/expensive. Uses a single KV counter per IP per time window rather
+// than a sliding log, since this only needs to stop abuse, not be precise.
+// Fails open (allows the request) if KV isn't configured yet.
 async function checkRateLimit(request, env){
-  if(!env.TRACKER_KV) return true; // fail open if KV isn't set up yet
+  if(!env.TRACKER_KV) return true;
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const windowId = Math.floor(Date.now() / 1000 / RATE_LIMIT_WINDOW_SEC);
   const key = `ratelimit:${ip}:${windowId}`;
@@ -84,7 +93,7 @@ async function saveTrades(env, trades){
 // endpoint below, which returns a `type` field (SWAP, TRANSFER, etc.)
 // straight from Helius instead of us having to guess from raw balance
 // deltas. Falls back to an empty array on any failure so a single bad
-// wallet/API hiccup doesn't kill the whole poll cycle for other wallets.
+// wallet/API hiccup doesn't kill the whole poll cycle / scan for others.
 async function fetchWalletHistory(address, env, limit = 25){
   const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=${limit}`;
   try{
@@ -132,96 +141,6 @@ function detectSwap(tx, address){
   return null;
 }
 
-// One-shot version of the whale-scan + buyer-check combo: finds token A's
-// top holders (already filtered to real wallets, not pools/programs), then
-// checks each one for genuine swap-buys of token B. Nothing gets saved —
-// no tracking, no KV — this is purely "who overlaps" on demand.
-async function scanCrossBuyers(sourceMint, targetMint, env){
-  const { holders } = await scanTokenHolders(sourceMint, env);
-  const whales = holders.filter(h => h.type === 'wallet');
-  if(!whales.length) return { results: [], scannedWallets: 0, priceUsd: null };
-
-  const wallets = whales.map(h => ({ address: h.address, label: null }));
-  const { results, priceUsd } = await findMintBuyers(wallets, targetMint, env);
-
-  // Attach each match's % holding of the source token too, for context —
-  // e.g. "this wallet holds 3.2% of MAD and also bought 400 BOP."
-  const pctBySource = Object.fromEntries(whales.map(h => [h.address, h.pctSupply]));
-  const enriched = results.map(r => ({ ...r, sourcePctSupply: pctBySource[r.address] ?? null }));
-
-  return { results: enriched, scannedWallets: wallets.length, priceUsd };
-}
-
-// Looks at a wallet's own recent outgoing SOL transfers and finds other
-// addresses it directly funded — the common pattern when someone spins up
-// a fresh "burner" wallet: move some SOL over from the known wallet first,
-// then trade from the burner. Filters out dust (default 0.05 SOL) since
-// real funding-for-trading transfers are rarely that small, and caps the
-// candidate list so the follow-up scan stays bounded.
-async function findFundedWallets(devWallet, env, { historyLimit = 100, minSol = 0.05, maxCandidates = 20 } = {}){
-  const history = await fetchWalletHistory(devWallet, env, historyLimit);
-  const funded = {};
-  for(const tx of history){
-    if(tx.transactionError) continue;
-    for(const nt of tx.nativeTransfers || []){
-      if(nt.fromUserAccount !== devWallet || !nt.toUserAccount || nt.toUserAccount === devWallet) continue;
-      const sol = nt.amount / 1e9;
-      if(sol < minSol) continue;
-      if(!funded[nt.toUserAccount]){
-        funded[nt.toUserAccount] = { totalSol: 0, firstSeen: tx.timestamp, lastSeen: tx.timestamp, transfers: 0 };
-      }
-      const f = funded[nt.toUserAccount];
-      f.totalSol += sol;
-      f.transfers += 1;
-      f.firstSeen = Math.min(f.firstSeen, tx.timestamp);
-      f.lastSeen = Math.max(f.lastSeen, tx.timestamp);
-    }
-  }
-  return Object.entries(funded)
-    .map(([address, info]) => ({ address, ...info }))
-    .sort((a, b) => b.totalSol - a.totalSol)
-    .slice(0, maxCandidates);
-}
-
-// Combines the funding trace above with the same buy-detection used
-// elsewhere: find wallets the known address funded directly, then check
-// each for a genuine swap-buy of the target token. Only catches on-chain
-// funding — if the burner was funded from a CEX withdrawal instead, there's
-// no link to trace and this will come back empty.
-async function traceFunderBuyers(devWallet, targetMint, env){
-  const candidates = await findFundedWallets(devWallet, env);
-  if(!candidates.length) return { results: [], candidateCount: 0, priceUsd: null };
-
-  const wallets = candidates.map(c => ({ address: c.address, label: null }));
-  const { results, priceUsd } = await findMintBuyers(wallets, targetMint, env);
-
-  const fundedInfo = Object.fromEntries(candidates.map(c => [c.address, c]));
-  const enriched = results.map(r => ({
-    ...r,
-    fundedSol: fundedInfo[r.address]?.totalSol ?? null,
-    fundedAt: fundedInfo[r.address]?.firstSeen ?? null,
-  }));
-
-  return { results: enriched, candidateCount: candidates.length, priceUsd };
-}
-
-// A token's creation transaction is public — pulling the mint address's
-// very first transaction and reading who paid for it identifies the
-// deployer in most cases, especially pump.fun-style launches where the
-// creator wallet signs the creation tx directly. Less reliable for tokens
-// launched through a program/factory, where the fee payer might be a
-// deployer *contract* rather than a person's wallet — worth sanity-checking
-// the result against what you already know about the project.
-async function findTokenDeployer(mint, env){
-  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?api-key=${env.HELIUS_API_KEY}&limit=1&sort-order=asc`;
-  const res = await fetch(url);
-  if(!res.ok) throw new Error(`Deployer lookup failed: ${res.status}`);
-  const data = await res.json();
-  const tx = Array.isArray(data) ? data[0] : null;
-  if(!tx) return { deployer: null, signature: null, timestamp: null };
-  return { deployer: tx.feePayer || null, signature: tx.signature || null, timestamp: tx.timestamp || null };
-}
-
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
@@ -240,46 +159,42 @@ async function getTokenPriceUsd(mint){
   }catch(e){ return null; }
 }
 
-// For each tracked wallet, pulls its recent history and checks whether any
-// genuine swap (reusing the exact same detectSwap logic the poller uses,
-// so "bought" means the same thing everywhere in this app) received the
-// target mint. Deliberately does NOT count plain transfers/airdrops of the
-// token as a "buy" — only actual swaps count.
-//
-// Scope limitation worth knowing: this only looks at each wallet's most
-// recent transactions (default 50), not full history, so an old buy well
-// outside that window won't surface. Good for "did they buy this recently /
-// are they currently accumulating," not a lifetime audit.
+// Checks one wallet's recent swap history for genuine buys of the target
+// mint. Shared by findMintBuyers (flat list) and traceLineageForBuyers
+// (multi-hop), so "bought" means exactly the same thing everywhere. Does
+// NOT count plain transfers/airdrops as a "buy" — only actual swaps.
+async function checkWalletBought(address, targetMint, env, historyLimit = 50){
+  const history = await fetchWalletHistory(address, env, historyLimit);
+  let totalBought = 0, buyCount = 0, lastBuyTimestamp = null;
+  for(const tx of history){
+    if(tx.transactionError) continue;
+    const changes = detectSwap(tx, address);
+    if(!changes) continue;
+    const bought = changes.find(c => c.mint === targetMint && c.amount > 0);
+    if(bought){
+      totalBought += bought.amount;
+      buyCount += 1;
+      if(!lastBuyTimestamp || tx.timestamp > lastBuyTimestamp) lastBuyTimestamp = tx.timestamp;
+    }
+  }
+  return totalBought > 0 ? { totalBought, buyCount, lastBuyTimestamp } : null;
+}
+
+// Flat version: checks a given list of wallets against one target mint.
 async function findMintBuyers(wallets, targetMint, env){
   const priceUsd = await getTokenPriceUsd(targetMint);
   const results = [];
 
   for(const wallet of wallets){
-    const history = await fetchWalletHistory(wallet.address, env, 50);
-    let totalBought = 0;
-    let buyCount = 0;
-    let lastBuyTimestamp = null;
-
-    for(const tx of history){
-      if(tx.transactionError) continue;
-      const changes = detectSwap(tx, wallet.address);
-      if(!changes) continue;
-      const bought = changes.find(c => c.mint === targetMint && c.amount > 0);
-      if(bought){
-        totalBought += bought.amount;
-        buyCount += 1;
-        if(!lastBuyTimestamp || tx.timestamp > lastBuyTimestamp) lastBuyTimestamp = tx.timestamp;
-      }
-    }
-
-    if(totalBought > 0){
+    const bought = await checkWalletBought(wallet.address, targetMint, env);
+    if(bought){
       results.push({
         address: wallet.address,
         label: wallet.label || null,
-        totalBought,
-        valueUsd: priceUsd != null ? totalBought * priceUsd : null,
-        buyCount,
-        lastBuyTimestamp,
+        totalBought: bought.totalBought,
+        valueUsd: priceUsd != null ? bought.totalBought * priceUsd : null,
+        buyCount: bought.buyCount,
+        lastBuyTimestamp: bought.lastBuyTimestamp,
       });
     }
   }
@@ -317,7 +232,6 @@ async function scanTokenHolders(mint, env){
   const tokenAccounts = (largest?.value || []).filter(a => Number(a.amount) > 0);
   if(!tokenAccounts.length) return { holders: [], totalSupply: 0 };
 
-  // Resolve each top token account to the wallet/PDA that actually owns it.
   const accountInfos = await rpcCall(env, 'getMultipleAccounts', [
     tokenAccounts.map(a => a.address),
     { encoding: 'jsonParsed' },
@@ -330,7 +244,6 @@ async function scanTokenHolders(mint, env){
   const supplyResult = await rpcCall(env, 'getTokenSupply', [mint]);
   const totalSupply = Number(supplyResult?.value?.uiAmount || 0);
 
-  // One batched call to check what kind of account each unique owner is.
   const uniqueOwners = [...new Set(owned.map(o => o.owner))];
   const ownerInfos = await rpcCall(env, 'getMultipleAccounts', [uniqueOwners, { encoding: 'base64' }]);
   const ownerType = {};
@@ -351,14 +264,154 @@ async function scanTokenHolders(mint, env){
   return { holders, totalSupply };
 }
 
+// One-shot version of the whale-scan + buyer-check combo: finds token A's
+// top holders (already filtered to real wallets, not pools/programs), then
+// checks each one for genuine swap-buys of token B. Nothing gets saved —
+// no tracking, no KV — this is purely "who overlaps" on demand.
+async function scanCrossBuyers(sourceMint, targetMint, env){
+  const { holders } = await scanTokenHolders(sourceMint, env);
+  const whales = holders.filter(h => h.type === 'wallet');
+  if(!whales.length) return { results: [], scannedWallets: 0, priceUsd: null };
+
+  const wallets = whales.map(h => ({ address: h.address, label: null }));
+  const { results, priceUsd } = await findMintBuyers(wallets, targetMint, env);
+
+  const pctBySource = Object.fromEntries(whales.map(h => [h.address, h.pctSupply]));
+  const enriched = results.map(r => ({ ...r, sourcePctSupply: pctBySource[r.address] ?? null }));
+
+  return { results: enriched, scannedWallets: wallets.length, priceUsd };
+}
+
+// A token's creation transaction is public — pulling the mint address's
+// very first transaction and reading who paid for it identifies the
+// deployer in most cases, especially pump.fun-style launches where the
+// creator wallet signs the creation tx directly. Less reliable for tokens
+// launched through a program/factory, where the fee payer might be a
+// deployer *contract* rather than a person's wallet.
+async function findTokenDeployer(mint, env){
+  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?api-key=${env.HELIUS_API_KEY}&limit=1&sort-order=asc`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`Deployer lookup failed: ${res.status}`);
+  const data = await res.json();
+  const tx = Array.isArray(data) ? data[0] : null;
+  if(!tx) return { deployer: null, signature: null, timestamp: null };
+  return { deployer: tx.feePayer || null, signature: tx.signature || null, timestamp: tx.timestamp || null };
+}
+
+// Multi-hop funding-lineage trace: starting from a known wallet, follows
+// the chain of "who did this wallet fund with SOL" outward several hops,
+// checking every wallet discovered along the way for a genuine buy of the
+// target token. Each level is fetched in parallel (Promise.all) to keep
+// wall-clock time down, and each wallet's history is fetched once and
+// reused for both the buy-check and the next hop's expansion.
+//
+// Bounded on three axes so this can't run away: depth, branching factor per
+// wallet (top N funded addresses by SOL, not all of them), and a hard cap
+// on total wallets scanned across the whole trace. Only catches on-chain
+// funding — if a burner was funded straight from a CEX withdrawal, there's
+// no link to follow and it won't show up here.
+async function traceLineageForBuyers(rootWallet, targetMint, env, opts = {}){
+  const {
+    maxDepth = 2,
+    maxFundedPerWallet = 8,
+    maxTotalWallets = 40,
+    minSol = 0.05,
+    historyLimit = 100,
+  } = opts;
+
+  const visited = new Set([rootWallet]);
+  let currentLevel = [{ address: rootWallet, fundedBy: null }];
+  const foundBuyers = {};
+  let scanned = 0;
+
+  for(let depth = 0; depth <= maxDepth && currentLevel.length && scanned < maxTotalWallets; depth++){
+    const budget = maxTotalWallets - scanned;
+    const batch = currentLevel.slice(0, budget);
+    scanned += batch.length;
+
+    const histories = await Promise.all(
+      batch.map(node => fetchWalletHistory(node.address, env, historyLimit).catch(() => []))
+    );
+
+    const nextLevel = [];
+    batch.forEach((node, i) => {
+      const history = histories[i];
+
+      // Check this wallet for genuine swap-buys of the target token
+      // (skip the root itself — that's the already-known wallet).
+      if(depth > 0){
+        for(const tx of history){
+          if(tx.transactionError) continue;
+          const changes = detectSwap(tx, node.address);
+          if(!changes) continue;
+          const bought = changes.find(c => c.mint === targetMint && c.amount > 0);
+          if(!bought) continue;
+          if(!foundBuyers[node.address]){
+            foundBuyers[node.address] = {
+              address: node.address, depth, fundedBy: node.fundedBy,
+              totalBought: 0, buyCount: 0, lastBuyTimestamp: null,
+            };
+          }
+          const f = foundBuyers[node.address];
+          f.totalBought += bought.amount;
+          f.buyCount += 1;
+          if(!f.lastBuyTimestamp || tx.timestamp > f.lastBuyTimestamp) f.lastBuyTimestamp = tx.timestamp;
+        }
+      }
+
+      // Expand outward: who did this wallet fund directly with SOL?
+      if(depth < maxDepth){
+        const funded = {};
+        for(const tx of history){
+          if(tx.transactionError) continue;
+          for(const nt of tx.nativeTransfers || []){
+            if(nt.fromUserAccount !== node.address || !nt.toUserAccount || nt.toUserAccount === node.address) continue;
+            const sol = nt.amount / 1e9;
+            if(sol < minSol) continue;
+            funded[nt.toUserAccount] = (funded[nt.toUserAccount] || 0) + sol;
+          }
+        }
+        Object.entries(funded)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, maxFundedPerWallet)
+          .forEach(([addr]) => {
+            if(visited.has(addr)) return;
+            visited.add(addr);
+            nextLevel.push({ address: addr, fundedBy: node.address });
+          });
+      }
+    });
+
+    currentLevel = nextLevel;
+  }
+
+  const priceUsd = await getTokenPriceUsd(targetMint);
+  const results = Object.values(foundBuyers)
+    .map(r => ({ ...r, valueUsd: priceUsd != null ? r.totalBought * priceUsd : null }))
+    .sort((a, b) => (b.valueUsd ?? b.totalBought) - (a.valueUsd ?? a.totalBought));
+
+  return { results, scannedWallets: scanned, priceUsd, truncated: scanned >= maxTotalWallets };
+}
+
+// Labels a detected swap as BUY or SELL based on which direction SOL moved
+// (spent SOL = bought the other asset, received SOL = sold it). Falls back
+// to a generic "SWAP" label for token-to-token trades with no SOL leg.
+function tradeDirection(changes){
+  const solChange = changes.find(c => c.mint === SOL_MINT);
+  if(!solChange) return 'SWAP';
+  return solChange.amount < 0 ? 'BUY' : 'SELL';
+}
+
 async function sendDiscordAlert(env, wallet, tx, changes){
   if(!env.DISCORD_WEBHOOK_URL) return;
+  const direction = tradeDirection(changes);
+  const emoji = direction === 'BUY' ? '🟢' : direction === 'SELL' ? '🔴' : '🔁';
   const lines = changes.map(c=>{
     const sym = (c.mint||'').trim() === SOL_MINT ? 'SOL' : (c.mint||'').slice(0,4)+'…';
     const amt = Math.abs(c.amount).toLocaleString(undefined,{maximumFractionDigits:4});
     return `${c.amount>0?'+':'-'}${amt} ${sym}`;
   }).join('  ·  ');
-  const content = `🐋 **Whale trade detected**\n**${walletLabel(wallet)}**\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const content = `🐋 **Whale ${direction} detected** ${emoji}\n**${walletLabel(wallet)}**\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(env.DISCORD_WEBHOOK_URL, {
       method: 'POST',
@@ -366,6 +419,30 @@ async function sendDiscordAlert(env, wallet, tx, changes){
       body: JSON.stringify({ content }),
     });
   }catch(e){ console.warn('Discord alert failed', e); }
+}
+
+// Second, independent alert channel — Telegram, alongside Discord (not a
+// replacement). Uses the plain Bot API sendMessage endpoint: create a bot
+// via @BotFather, get its token, then get your chat ID by messaging the
+// bot once and checking https://api.telegram.org/bot<TOKEN>/getUpdates (or
+// using a helper bot like @userinfobot for your personal chat ID).
+async function sendTelegramAlert(env, wallet, tx, changes){
+  if(!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  const direction = tradeDirection(changes);
+  const emoji = direction === 'BUY' ? '🟢' : direction === 'SELL' ? '🔴' : '🔁';
+  const lines = changes.map(c=>{
+    const sym = (c.mint||'').trim() === SOL_MINT ? 'SOL' : (c.mint||'').slice(0,4)+'…';
+    const amt = Math.abs(c.amount).toLocaleString(undefined,{maximumFractionDigits:4});
+    return `${c.amount>0?'+':'-'}${amt} ${sym}`;
+  }).join('  ·  ');
+  const text = `${emoji} Whale ${direction} detected\n${walletLabel(wallet)}\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  try{
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text }),
+    });
+  }catch(e){ console.warn('Telegram alert failed', e); }
 }
 
 // Core poll loop: for each tracked wallet, fetch recent history, find
@@ -382,17 +459,13 @@ async function pollWallets(env){
     const history = await fetchWalletHistory(wallet.address, env);
     if(!history.length) continue;
 
-    // History is newest-first. Walk it until we hit the signature we
-    // processed last time, collecting only genuinely new transactions.
     const newTxs = [];
     for(const tx of history){
       if(tx.signature === lastSeenSig) break;
       newTxs.push(tx);
     }
-    // First-ever poll of a wallet: don't dump its entire recent history as
-    // "new" trades/alerts — just establish a starting point silently.
     if(lastSeenSig){
-      newTxs.reverse(); // oldest-first, so log/alerts land in chronological order
+      newTxs.reverse();
       for(const tx of newTxs){
         if(tx.transactionError) continue;
         const changes = detectSwap(tx, wallet.address);
@@ -405,6 +478,7 @@ async function pollWallets(env){
           changes: changes.map(c=>({ mint: c.mint, amount: c.amount })),
         });
         await sendDiscordAlert(env, wallet, tx, changes);
+        await sendTelegramAlert(env, wallet, tx, changes);
       }
     }
 
@@ -422,6 +496,7 @@ async function handleApi(request, env){
       kvConfigured: !!env.TRACKER_KV,
       heliusConfigured: !!env.HELIUS_API_KEY,
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
+      telegramConfigured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     });
   }
 
@@ -444,7 +519,7 @@ async function handleApi(request, env){
     }
   }
 
-  if(url.pathname === '/api/trace-funder' && request.method === 'GET'){
+  if(url.pathname === '/api/trace-lineage' && request.method === 'GET'){
     if(!(await checkRateLimit(request, env))){
       return json({ error: 'Too many requests. Try again in a minute.' }, 429);
     }
@@ -453,13 +528,15 @@ async function handleApi(request, env){
     }
     const wallet = (url.searchParams.get('wallet') || '').trim();
     const target = (url.searchParams.get('target') || '').trim();
+    const hopsParam = parseInt(url.searchParams.get('hops') || '2', 10);
+    const maxDepth = Math.min(4, Math.max(1, isNaN(hopsParam) ? 2 : hopsParam));
     if(!isValidSolanaAddress(wallet)) return json({ error: 'Invalid wallet address.' }, 400);
     if(!isValidSolanaAddress(target)) return json({ error: 'Invalid target token address.' }, 400);
     try{
-      const data = await traceFunderBuyers(wallet, target, env);
+      const data = await traceLineageForBuyers(wallet, target, env, { maxDepth });
       return json(data);
     }catch(e){
-      console.warn('trace-funder failed', e);
+      console.warn('trace-lineage failed', e);
       return json({ error: 'Trace failed. Double-check both addresses and try again.' }, 500);
     }
   }
@@ -571,8 +648,6 @@ async function handleApi(request, env){
     if(!(await checkRateLimit(request, env))){
       return json({ error: 'Too many requests. Try again in a minute.' }, 429);
     }
-    // Manual trigger, mainly for testing without waiting up to 5 minutes
-    // for the next scheduled run.
     await pollWallets(env);
     return json({ ok: true });
   }
