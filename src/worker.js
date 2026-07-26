@@ -94,8 +94,13 @@ async function saveTrades(env, trades){
 // straight from Helius instead of us having to guess from raw balance
 // deltas. Falls back to an empty array on any failure so a single bad
 // wallet/API hiccup doesn't kill the whole poll cycle / scan for others.
-async function fetchWalletHistory(address, env, limit = 25){
-  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=${limit}`;
+//
+// Works for any address, not just wallets — a token mint's own address has
+// a transaction history too (every transfer/swap involving it), which is
+// how the early-buyer scan below works.
+async function fetchAddressTransactions(address, env, { limit = 25, sortOrder } = {}){
+  let url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=${limit}`;
+  if(sortOrder) url += `&sort-order=${sortOrder}`;
   try{
     const res = await fetch(url);
     if(!res.ok){
@@ -108,6 +113,10 @@ async function fetchWalletHistory(address, env, limit = 25){
     console.warn(`Helius history fetch threw for ${address}:`, e);
     return [];
   }
+}
+
+async function fetchWalletHistory(address, env, limit = 25){
+  return fetchAddressTransactions(address, env, { limit });
 }
 
 // Reduces a parsed transaction's tokenTransfers + nativeTransfers down to
@@ -157,6 +166,48 @@ async function getTokenPriceUsd(mint){
     const data = await res.json();
     return data?.[mint]?.usdPrice ?? null;
   }catch(e){ return null; }
+}
+
+// Rough bot/sniper signal: walks a wallet's recent swap history in
+// chronological order and measures how quickly it typically flips a
+// position (time between buying a token and selling that same token
+// again). Bots that snipe new launches tend to hold for seconds to a few
+// minutes across a high volume of trades; a discretionary trader's hold
+// times are usually longer and far less uniform. This is a heuristic, not
+// a certainty — a genuinely fast human scalper would also trip it, so
+// treat it as a flag worth checking, not a verdict.
+async function analyzeSniperBehavior(address, env, historyLimit = 100){
+  const history = await fetchWalletHistory(address, env, historyLimit);
+  const chron = [...history].reverse(); // oldest first — needed to measure hold time correctly
+  const openBuys = {}; // mint -> FIFO queue of buy timestamps
+  const flipSeconds = [];
+  let swapCount = 0;
+
+  for(const tx of chron){
+    if(tx.transactionError) continue;
+    const changes = detectSwap(tx, address);
+    if(!changes) continue;
+    swapCount += 1;
+    for(const c of changes){
+      if(c.mint === SOL_MINT) continue;
+      if(c.amount > 0){
+        if(!openBuys[c.mint]) openBuys[c.mint] = [];
+        openBuys[c.mint].push(tx.timestamp);
+      } else if(c.amount < 0 && openBuys[c.mint] && openBuys[c.mint].length){
+        const buyTs = openBuys[c.mint].shift();
+        flipSeconds.push(tx.timestamp - buyTs);
+      }
+    }
+  }
+
+  const avgFlipSeconds = flipSeconds.length
+    ? Math.round(flipSeconds.reduce((a, b) => a + b, 0) / flipSeconds.length)
+    : null;
+  // Active (12+ swaps in the fetched window) AND fast-flipping (under 10 min
+  // average hold) reads as automated rather than discretionary.
+  const likelyBot = swapCount >= 12 && avgFlipSeconds != null && avgFlipSeconds < 600;
+
+  return { swapCount, avgFlipSeconds, flipsMeasured: flipSeconds.length, likelyBot };
 }
 
 // Checks one wallet's recent swap history for genuine buys of the target
@@ -227,6 +278,21 @@ async function rpcCall(env, method, params){
 // owned by the System Program. Pool vaults, staking accounts, and other
 // PDAs are owned by whatever program created them. Checking that one field
 // is enough to tell "trader" from "infrastructure" without guessing.
+// Same wallet-vs-program-account check used in scanTokenHolders, pulled out
+// standalone so early-buyer detection can reuse it without re-scanning
+// holders — pool/vault addresses show up as "buyers" in raw transfer data
+// too, and need the same filtering.
+async function classifyOwners(addresses, env){
+  if(!addresses.length) return {};
+  const infos = await rpcCall(env, 'getMultipleAccounts', [addresses, { encoding: 'base64' }]);
+  const map = {};
+  addresses.forEach((addr, i) => {
+    const info = infos?.value?.[i];
+    map[addr] = info && info.owner === SYSTEM_PROGRAM_ID ? 'wallet' : 'program';
+  });
+  return map;
+}
+
 async function scanTokenHolders(mint, env){
   const largest = await rpcCall(env, 'getTokenLargestAccounts', [mint]);
   const tokenAccounts = (largest?.value || []).filter(a => Number(a.amount) > 0);
@@ -264,6 +330,56 @@ async function scanTokenHolders(mint, env){
   return { holders, totalSupply };
 }
 
+// Finds the earliest wallets to buy a token after its creation, then
+// classifies each as likely-bot or likely-discretionary using
+// analyzeSniperBehavior. Pool/vault addresses that receive the token during
+// initial liquidity setup are filtered out the same way whale-scan filters
+// them — those aren't buyers, they're infrastructure.
+//
+// Cost note: this does one call to fetch the token's early history, one
+// batched call to classify owners, then one more call per surviving
+// candidate to analyze their trading pattern — so it scales with how many
+// early buyers are found, capped at maxCandidates to keep it bounded.
+async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15 } = {}){
+  const history = await fetchAddressTransactions(mint, env, { limit: earlyLimit, sortOrder: 'asc' });
+  if(!history.length) return { creationTimestamp: null, results: [] };
+
+  const creationTimestamp = history[0].timestamp || null;
+
+  // Earliest transfer of the token to each address, in chronological order.
+  const seen = new Map();
+  for(const tx of history){
+    if(tx.transactionError) continue;
+    for(const tt of tx.tokenTransfers || []){
+      if(tt.mint !== mint || !tt.toUserAccount) continue;
+      if(!seen.has(tt.toUserAccount)){
+        seen.set(tt.toUserAccount, { timestamp: tx.timestamp, amount: tt.tokenAmount });
+      }
+    }
+  }
+
+  const candidates = [...seen.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+  const addresses = candidates.map(([addr]) => addr);
+  const ownerType = await classifyOwners(addresses, env);
+
+  const wallets = candidates
+    .filter(([addr]) => ownerType[addr] === 'wallet')
+    .slice(0, maxCandidates);
+
+  const results = [];
+  for(const [address, info] of wallets){
+    const behavior = await analyzeSniperBehavior(address, env);
+    results.push({
+      address,
+      secondsAfterLaunch: creationTimestamp != null ? info.timestamp - creationTimestamp : null,
+      amountBought: info.amount,
+      ...behavior,
+    });
+  }
+
+  return { creationTimestamp, results };
+}
+
 // One-shot version of the whale-scan + buyer-check combo: finds token A's
 // top holders (already filtered to real wallets, not pools/programs), then
 // checks each one for genuine swap-buys of token B. Nothing gets saved —
@@ -289,11 +405,8 @@ async function scanCrossBuyers(sourceMint, targetMint, env){
 // launched through a program/factory, where the fee payer might be a
 // deployer *contract* rather than a person's wallet.
 async function findTokenDeployer(mint, env){
-  const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?api-key=${env.HELIUS_API_KEY}&limit=1&sort-order=asc`;
-  const res = await fetch(url);
-  if(!res.ok) throw new Error(`Deployer lookup failed: ${res.status}`);
-  const data = await res.json();
-  const tx = Array.isArray(data) ? data[0] : null;
+  const history = await fetchAddressTransactions(mint, env, { limit: 1, sortOrder: 'asc' });
+  const tx = history[0];
   if(!tx) return { deployer: null, signature: null, timestamp: null };
   return { deployer: tx.feePayer || null, signature: tx.signature || null, timestamp: tx.timestamp || null };
 }
@@ -393,25 +506,36 @@ async function traceLineageForBuyers(rootWallet, targetMint, env, opts = {}){
   return { results, scannedWallets: scanned, priceUsd, truncated: scanned >= maxTotalWallets };
 }
 
-// Labels a detected swap as BUY or SELL based on which direction SOL moved
-// (spent SOL = bought the other asset, received SOL = sold it). Falls back
-// to a generic "SWAP" label for token-to-token trades with no SOL leg.
-function tradeDirection(changes){
-  const solChange = changes.find(c => c.mint === SOL_MINT);
-  if(!solChange) return 'SWAP';
-  return solChange.amount < 0 ? 'BUY' : 'SELL';
+// Labels a detected event for display/alerts. Swaps get BUY/SELL based on
+// which way SOL moved (falling back to a generic SWAP for token-to-token
+// trades). Plain transfers — not swaps, just a balance moving in or out —
+// get their own SENT/RECEIVED label so they're never confused with an
+// actual buy or sell.
+function classifyEvent(changes, isSwap){
+  if(isSwap){
+    const solChange = changes.find(c => c.mint === SOL_MINT);
+    if(!solChange) return { label: 'SWAP', emoji: '🔁' };
+    return solChange.amount < 0 ? { label: 'BUY', emoji: '🟢' } : { label: 'SELL', emoji: '🔴' };
+  }
+  const primary = changes[0];
+  if(!primary) return { label: 'TRANSFER', emoji: '🔁' };
+  return primary.amount < 0 ? { label: 'SENT', emoji: '📤' } : { label: 'RECEIVED', emoji: '📥' };
 }
 
-async function sendDiscordAlert(env, wallet, tx, changes){
-  if(!env.DISCORD_WEBHOOK_URL) return;
-  const direction = tradeDirection(changes);
-  const emoji = direction === 'BUY' ? '🟢' : direction === 'SELL' ? '🔴' : '🔁';
-  const lines = changes.map(c=>{
+function formatChangeLines(changes){
+  return changes.map(c=>{
     const sym = (c.mint||'').trim() === SOL_MINT ? 'SOL' : (c.mint||'').slice(0,4)+'…';
     const amt = Math.abs(c.amount).toLocaleString(undefined,{maximumFractionDigits:4});
     return `${c.amount>0?'+':'-'}${amt} ${sym}`;
   }).join('  ·  ');
-  const content = `🐋 **Whale ${direction} detected** ${emoji}\n**${walletLabel(wallet)}**\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+}
+
+async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true){
+  if(!env.DISCORD_WEBHOOK_URL) return;
+  const { label, emoji } = classifyEvent(changes, isSwap);
+  const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const lines = formatChangeLines(changes);
+  const content = `🐋 **Whale ${verb}** ${emoji}\n**${walletLabel(wallet)}**\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(env.DISCORD_WEBHOOK_URL, {
       method: 'POST',
@@ -426,16 +550,12 @@ async function sendDiscordAlert(env, wallet, tx, changes){
 // via @BotFather, get its token, then get your chat ID by messaging the
 // bot once and checking https://api.telegram.org/bot<TOKEN>/getUpdates (or
 // using a helper bot like @userinfobot for your personal chat ID).
-async function sendTelegramAlert(env, wallet, tx, changes){
+async function sendTelegramAlert(env, wallet, tx, changes, isSwap = true){
   if(!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
-  const direction = tradeDirection(changes);
-  const emoji = direction === 'BUY' ? '🟢' : direction === 'SELL' ? '🔴' : '🔁';
-  const lines = changes.map(c=>{
-    const sym = (c.mint||'').trim() === SOL_MINT ? 'SOL' : (c.mint||'').slice(0,4)+'…';
-    const amt = Math.abs(c.amount).toLocaleString(undefined,{maximumFractionDigits:4});
-    return `${c.amount>0?'+':'-'}${amt} ${sym}`;
-  }).join('  ·  ');
-  const text = `${emoji} Whale ${direction} detected\n${walletLabel(wallet)}\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const { label, emoji } = classifyEvent(changes, isSwap);
+  const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const lines = formatChangeLines(changes);
+  const text = `${emoji} Whale ${verb}\n${walletLabel(wallet)}\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
@@ -446,8 +566,10 @@ async function sendTelegramAlert(env, wallet, tx, changes){
 }
 
 // Core poll loop: for each tracked wallet, fetch recent history, find
-// transactions newer than the last one we've already processed, detect
-// swaps among them, log to the trades feed, and alert Discord for each.
+// transactions newer than the last one we've already processed, and alert
+// on every one that actually moves a balance — genuine swaps (buy/sell)
+// and plain transfers (sent/received) alike, each clearly labeled so a
+// transfer is never mistaken for a trade.
 async function pollWallets(env){
   if(!env.TRACKER_KV || !env.HELIUS_API_KEY) return;
   const wallets = await getWallets(env);
@@ -468,17 +590,37 @@ async function pollWallets(env){
       newTxs.reverse();
       for(const tx of newTxs){
         if(tx.transactionError) continue;
-        const changes = detectSwap(tx, wallet.address);
-        if(!changes) continue;
-        trades.unshift({
-          wallet: wallet.address,
-          label: wallet.label || null,
-          signature: tx.signature,
-          timestamp: tx.timestamp,
-          changes: changes.map(c=>({ mint: c.mint, amount: c.amount })),
-        });
-        await sendDiscordAlert(env, wallet, tx, changes);
-        await sendTelegramAlert(env, wallet, tx, changes);
+
+        const swapChanges = detectSwap(tx, wallet.address);
+        if(swapChanges){
+          const { label } = classifyEvent(swapChanges, true);
+          trades.unshift({
+            wallet: wallet.address, label: wallet.label || null,
+            kind: 'swap', eventLabel: label,
+            signature: tx.signature, timestamp: tx.timestamp,
+            changes: swapChanges.map(c=>({ mint: c.mint, amount: c.amount })),
+          });
+          await sendDiscordAlert(env, wallet, tx, swapChanges, true);
+          await sendTelegramAlert(env, wallet, tx, swapChanges, true);
+          continue;
+        }
+
+        // Not a swap — check if this tx is a plain transfer moving a
+        // balance in or out. Only fires if something actually moved;
+        // unrelated instructions (NFT mints, program calls, etc.) are
+        // silently skipped, same as before.
+        const transferChanges = walletChanges(tx, wallet.address);
+        if(transferChanges.length){
+          const { label } = classifyEvent(transferChanges, false);
+          trades.unshift({
+            wallet: wallet.address, label: wallet.label || null,
+            kind: 'transfer', eventLabel: label,
+            signature: tx.signature, timestamp: tx.timestamp,
+            changes: transferChanges.map(c=>({ mint: c.mint, amount: c.amount })),
+          });
+          await sendDiscordAlert(env, wallet, tx, transferChanges, false);
+          await sendTelegramAlert(env, wallet, tx, transferChanges, false);
+        }
       }
     }
 
@@ -498,6 +640,25 @@ async function handleApi(request, env){
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
       telegramConfigured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     });
+  }
+
+  if(url.pathname === '/api/early-buyers' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const mint = (url.searchParams.get('mint') || '').trim();
+    if(!isValidSolanaAddress(mint)) return json({ error: 'Invalid token mint address.' }, 400);
+    try{
+      const data = await findEarlyBuyers(mint, env);
+      if(!data.creationTimestamp) return json({ error: "Couldn't find this token's creation transaction." }, 404);
+      return json(data);
+    }catch(e){
+      console.warn('early-buyers failed', e);
+      return json({ error: 'Scan failed. Double-check the mint address and try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/find-deployer' && request.method === 'GET'){
