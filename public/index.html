@@ -328,7 +328,7 @@ async function loadWallets(){
 
 async function loadTrades(){
   const el = $('tradeList');
-  const EVENT_EMOJI = { BUY:'🟢', SELL:'🔴', SWAP:'🟠', SENT:'🟡', RECEIVED:'🟡' };
+  const EVENT_EMOJI = { BUY:'🟢', SELL:'🔴', SWAP:'🔁', SENT:'🟡', RECEIVED:'🟡' };
   try{
     const res = await fetch('/api/trades');
     const data = await res.json();
