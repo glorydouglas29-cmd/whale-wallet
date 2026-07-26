@@ -328,7 +328,7 @@ async function loadWallets(){
 
 async function loadTrades(){
   const el = $('tradeList');
-  const EVENT_EMOJI = { BUY:'🟢', SELL:'🔴', SWAP:'🔁', SENT:'📤', RECEIVED:'📥' };
+  const EVENT_EMOJI = { BUY:'🟢', SELL:'🔴', SWAP:'🟠', SENT:'🟡', RECEIVED:'🟡' };
   try{
     const res = await fetch('/api/trades');
     const data = await res.json();
@@ -343,11 +343,17 @@ async function loadTrades(){
       }).join('');
       const emoji = EVENT_EMOJI[t.eventLabel] || '🐋';
       const tag = t.eventLabel ? ` · ${t.eventLabel}` : '';
+      const tokenLabel = t.tokenSymbol ? `$${t.tokenSymbol}` : (t.tokenMint ? short(t.tokenMint) : null);
+      const usdTag = t.usdValue != null ? ` · ~$${fmtNum(t.usdValue)}` : '';
+      const tokenLine = tokenLabel
+        ? `<div class="wallet-addr" style="margin-bottom:4px;">${tokenLabel}${t.tokenName ? ' ('+t.tokenName+')' : ''}${usdTag}${t.tokenMint ? ' · CA: '+t.tokenMint : ''}</div>`
+        : '';
       return `<div class="trade-row">
         <div class="trade-top">
           <span class="trade-whale">${emoji} ${t.label || short(t.wallet)}${tag}</span>
           <span class="trade-time">${t.timestamp ? timeAgo(t.timestamp) : '—'}</span>
         </div>
+        ${tokenLine}
         <div class="trade-changes">${changesHtml}</div>
         <a class="trade-link" href="https://solscan.io/tx/${t.signature}" target="_blank" rel="noopener">view transaction ↗</a>
       </div>`;
