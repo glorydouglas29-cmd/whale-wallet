@@ -150,9 +150,34 @@ function detectSwap(tx, address){
   return null;
 }
 
+function shortAddr(addr){
+  return addr ? `${addr.slice(0,4)}…${addr.slice(-4)}` : '';
+}
+
 function walletLabel(wallet){
   const short = wallet.address.slice(0,4) + '…' + wallet.address.slice(-4);
   return wallet.label ? `${wallet.label} (${short})` : short;
+}
+
+// Resolves a mint to its symbol/name via Jupiter's Token API v2 (same lite
+// endpoint family already used for pricing elsewhere in the degen suite —
+// no API key needed on this tier). SOL is hardcoded since it's not worth a
+// lookup. Falls back to nulls on any failure so a metadata hiccup never
+// blocks an alert from sending — the alert just shows the raw mint instead.
+async function getTokenMeta(mint){
+  if(mint === SOL_MINT) return { symbol: 'SOL', name: 'Solana' };
+  try{
+    const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${mint}`);
+    if(!res.ok) return { symbol: null, name: null };
+    const data = await res.json();
+    const match = Array.isArray(data) ? (data.find(t => t.address === mint) || data[0]) : null;
+    return match ? { symbol: match.symbol || null, name: match.name || null } : { symbol: null, name: null };
+  }catch(e){ return { symbol: null, name: null }; }
+}
+
+function formatUsd(value){
+  if(value == null) return null;
+  return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: value < 1 ? 6 : 2 });
 }
 
 // Same Jupiter Price API v3 used elsewhere in the degen suite (Rekt or
@@ -506,20 +531,28 @@ async function traceLineageForBuyers(rootWallet, targetMint, env, opts = {}){
   return { results, scannedWallets: scanned, priceUsd, truncated: scanned >= maxTotalWallets };
 }
 
-// Labels a detected event for display/alerts. Swaps get BUY/SELL based on
-// which way SOL moved (falling back to a generic SWAP for token-to-token
-// trades). Plain transfers — not swaps, just a balance moving in or out —
-// get their own SENT/RECEIVED label so they're never confused with an
-// actual buy or sell.
+// Labels a detected event for display/alerts, using four distinct colors:
+// green for buys, red for sells, orange for token-to-token swaps, yellow
+// for plain transfers (sent or received — direction still shown in the
+// label text so the two aren't confused with each other).
 function classifyEvent(changes, isSwap){
   if(isSwap){
     const solChange = changes.find(c => c.mint === SOL_MINT);
-    if(!solChange) return { label: 'SWAP', emoji: '🔁' };
+    if(!solChange) return { label: 'SWAP', emoji: '🟠' };
     return solChange.amount < 0 ? { label: 'BUY', emoji: '🟢' } : { label: 'SELL', emoji: '🔴' };
   }
   const primary = changes[0];
-  if(!primary) return { label: 'TRANSFER', emoji: '🔁' };
-  return primary.amount < 0 ? { label: 'SENT', emoji: '📤' } : { label: 'RECEIVED', emoji: '📥' };
+  if(!primary) return { label: 'TRANSFER', emoji: '🟡' };
+  return primary.amount < 0 ? { label: 'SENT', emoji: '🟡' } : { label: 'RECEIVED', emoji: '🟡' };
+}
+
+// Picks "the coin" an alert should foreground: the asset being acquired for
+// a BUY or a token-to-token SWAP, the asset being offloaded for a SELL, or
+// whatever single asset moved for a plain transfer.
+function primaryAsset(changes, label){
+  if(label === 'SELL') return changes.find(c => c.mint !== SOL_MINT && c.amount < 0) || changes[0];
+  if(label === 'BUY' || label === 'SWAP') return changes.find(c => c.mint !== SOL_MINT && c.amount > 0) || changes[0];
+  return changes[0]; // SENT/RECEIVED transfers
 }
 
 function formatChangeLines(changes){
@@ -530,12 +563,30 @@ function formatChangeLines(changes){
   }).join('  ·  ');
 }
 
-async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true){
+// Builds the shared "here's the coin" block used by both alert channels:
+// symbol, name, contract address (skipped for SOL — not worth showing),
+// amount, and USD value if a price was resolved. context = { asset, meta,
+// usdValue }, all optional — gracefully degrades to just the mint if
+// Jupiter didn't recognize the token.
+function buildTokenBlock(context, { markdown }){
+  const { asset, meta, usdValue } = context || {};
+  if(!asset) return '';
+  const symbolText = meta?.symbol ? `$${meta.symbol}` : shortAddr(asset.mint);
+  const symbol = markdown ? `**${symbolText}**` : symbolText;
+  const nameLine = meta?.name ? ` (${meta.name})` : '';
+  const caLine = asset.mint === SOL_MINT ? '' : `\nCA: ${markdown ? '`'+asset.mint+'`' : asset.mint}`;
+  const amt = `${asset.amount > 0 ? '+' : '-'}${Math.abs(asset.amount).toLocaleString(undefined,{maximumFractionDigits:4})}${meta?.symbol ? ' '+meta.symbol : ''}`;
+  const usd = usdValue != null ? ` (~$${formatUsd(usdValue)})` : '';
+  return `${symbol}${nameLine}${caLine}\n${amt}${usd}\n\n`;
+}
+
+async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.DISCORD_WEBHOOK_URL) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
   const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const tokenBlock = buildTokenBlock(context, { markdown: true });
   const lines = formatChangeLines(changes);
-  const content = `🐋 **Whale ${verb}** ${emoji}\n**${walletLabel(wallet)}**\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const content = `🐋 **Whale ${verb}** ${emoji}\n**${walletLabel(wallet)}**\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(env.DISCORD_WEBHOOK_URL, {
       method: 'POST',
@@ -550,12 +601,13 @@ async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true){
 // via @BotFather, get its token, then get your chat ID by messaging the
 // bot once and checking https://api.telegram.org/bot<TOKEN>/getUpdates (or
 // using a helper bot like @userinfobot for your personal chat ID).
-async function sendTelegramAlert(env, wallet, tx, changes, isSwap = true){
+async function sendTelegramAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
   const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const tokenBlock = buildTokenBlock(context, { markdown: false });
   const lines = formatChangeLines(changes);
-  const text = `${emoji} Whale ${verb}\n${walletLabel(wallet)}\n${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const text = `${emoji} Whale ${verb}\n${walletLabel(wallet)}\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
@@ -594,14 +646,23 @@ async function pollWallets(env){
         const swapChanges = detectSwap(tx, wallet.address);
         if(swapChanges){
           const { label } = classifyEvent(swapChanges, true);
+          const asset = primaryAsset(swapChanges, label);
+          const [meta, price] = await Promise.all([
+            getTokenMeta(asset.mint),
+            getTokenPriceUsd(asset.mint),
+          ]);
+          const usdValue = price != null ? Math.abs(asset.amount) * price : null;
+          const context = { asset, meta, usdValue };
+
           trades.unshift({
             wallet: wallet.address, label: wallet.label || null,
             kind: 'swap', eventLabel: label,
+            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue,
             signature: tx.signature, timestamp: tx.timestamp,
             changes: swapChanges.map(c=>({ mint: c.mint, amount: c.amount })),
           });
-          await sendDiscordAlert(env, wallet, tx, swapChanges, true);
-          await sendTelegramAlert(env, wallet, tx, swapChanges, true);
+          await sendDiscordAlert(env, wallet, tx, swapChanges, true, context);
+          await sendTelegramAlert(env, wallet, tx, swapChanges, true, context);
           continue;
         }
 
@@ -612,14 +673,23 @@ async function pollWallets(env){
         const transferChanges = walletChanges(tx, wallet.address);
         if(transferChanges.length){
           const { label } = classifyEvent(transferChanges, false);
+          const asset = primaryAsset(transferChanges, label);
+          const [meta, price] = await Promise.all([
+            getTokenMeta(asset.mint),
+            getTokenPriceUsd(asset.mint),
+          ]);
+          const usdValue = price != null ? Math.abs(asset.amount) * price : null;
+          const context = { asset, meta, usdValue };
+
           trades.unshift({
             wallet: wallet.address, label: wallet.label || null,
             kind: 'transfer', eventLabel: label,
+            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue,
             signature: tx.signature, timestamp: tx.timestamp,
             changes: transferChanges.map(c=>({ mint: c.mint, amount: c.amount })),
           });
-          await sendDiscordAlert(env, wallet, tx, transferChanges, false);
-          await sendTelegramAlert(env, wallet, tx, transferChanges, false);
+          await sendDiscordAlert(env, wallet, tx, transferChanges, false, context);
+          await sendTelegramAlert(env, wallet, tx, transferChanges, false, context);
         }
       }
     }
