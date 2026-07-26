@@ -538,7 +538,7 @@ async function traceLineageForBuyers(rootWallet, targetMint, env, opts = {}){
 function classifyEvent(changes, isSwap){
   if(isSwap){
     const solChange = changes.find(c => c.mint === SOL_MINT);
-    if(!solChange) return { label: 'SWAP', emoji: '🟠' };
+    if(!solChange) return { label: 'SWAP', emoji: '🔁' };
     return solChange.amount < 0 ? { label: 'BUY', emoji: '🟢' } : { label: 'SELL', emoji: '🔴' };
   }
   const primary = changes[0];
