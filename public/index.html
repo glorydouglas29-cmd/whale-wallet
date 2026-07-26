@@ -140,6 +140,17 @@
   <div class="tab-panel active" id="tab-discover">
 
   <div class="panel">
+    <div class="panel-title">Find early buyers (and spot bots)</div>
+    <div class="status-line" style="margin-bottom:10px;">Finds who bought a token soonest after launch, then flags which of them look like sniper bots vs. real traders — based on how fast they typically flip a position. A heuristic, not a verdict.</div>
+    <div class="add-row">
+      <input type="text" id="earlyMint" placeholder="Token contract (e.g. one that already pumped)…">
+      <button id="earlyBtn">Find early buyers</button>
+    </div>
+    <div class="status-line" id="earlyStatus"></div>
+    <div id="earlyResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Scan a token for whales</div>
     <div class="add-row">
       <input type="text" id="scanMint" placeholder="Token contract / mint address…">
@@ -317,6 +328,7 @@ async function loadWallets(){
 
 async function loadTrades(){
   const el = $('tradeList');
+  const EVENT_EMOJI = { BUY:'🟢', SELL:'🔴', SWAP:'🔁', SENT:'📤', RECEIVED:'📥' };
   try{
     const res = await fetch('/api/trades');
     const data = await res.json();
@@ -329,9 +341,11 @@ async function loadTrades(){
         const sign = c.amount>0?'+':'-';
         return `<span class="amt ${dir}">${sign}${fmtNum(Math.abs(c.amount))} ${sym}</span>`;
       }).join('');
+      const emoji = EVENT_EMOJI[t.eventLabel] || '🐋';
+      const tag = t.eventLabel ? ` · ${t.eventLabel}` : '';
       return `<div class="trade-row">
         <div class="trade-top">
-          <span class="trade-whale">🐋 ${t.label || short(t.wallet)}</span>
+          <span class="trade-whale">${emoji} ${t.label || short(t.wallet)}${tag}</span>
           <span class="trade-time">${t.timestamp ? timeAgo(t.timestamp) : '—'}</span>
         </div>
         <div class="trade-changes">${changesHtml}</div>
@@ -396,6 +410,55 @@ $('addBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Failed to add wallet.'; statusEl.className='status-line err';
   }finally{
     $('addBtn').disabled = false;
+  }
+});
+
+$('earlyBtn').addEventListener('click', async ()=>{
+  const mint = $('earlyMint').value.trim();
+  const statusEl = $('earlyStatus');
+  const resultsEl = $('earlyResults');
+  resultsEl.innerHTML = '';
+  if(!mint){ statusEl.textContent = 'Enter a token contract address.'; statusEl.className='status-line err'; return; }
+
+  $('earlyBtn').disabled = true;
+  statusEl.textContent = 'Finding early buyers, then checking each for bot-like flip patterns… this can take a bit.';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/early-buyers?mint=${encodeURIComponent(mint)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const results = data.results || [];
+    statusEl.textContent = `Found ${results.length} early wallet holder${results.length===1?'':'s'}, ordered by how soon after launch they bought.`;
+    statusEl.className = 'status-line ok';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">No individual wallet buyers found in this token's earliest activity.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>{
+      const secs = r.secondsAfterLaunch;
+      const timing = secs == null ? 'timing unknown'
+        : secs < 60 ? `${secs}s after launch`
+        : secs < 3600 ? `${Math.floor(secs/60)}m after launch`
+        : `${Math.floor(secs/3600)}h after launch`;
+      const botTag = r.likelyBot
+        ? `<span style="color:var(--down);">⚠ likely bot</span> (avg flip ${r.avgFlipSeconds}s across ${r.flipsMeasured} trades)`
+        : `looks discretionary${r.avgFlipSeconds!=null ? ' (avg flip '+Math.round(r.avgFlipSeconds/60)+'m)' : ''}`;
+      return `
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(r.address)} · ${timing}</div>
+          <div class="wallet-addr">${fmtNum(r.amountBought)} tokens · ${r.swapCount} recent swaps · ${botTag}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`;
+    }).join('');
+  }catch(e){
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
+  }finally{
+    $('earlyBtn').disabled = false;
   }
 });
 
