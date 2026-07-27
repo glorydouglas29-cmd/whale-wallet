@@ -156,6 +156,7 @@
 
   <nav class="tabs" role="tablist">
     <button class="tab-btn active" data-tab="discover" role="tab" aria-selected="true">Discover</button>
+    <button class="tab-btn" data-tab="score" role="tab" aria-selected="false">Score</button>
     <button class="tab-btn" data-tab="tracked" role="tab" aria-selected="false">Tracked</button>
     <button class="tab-btn" data-tab="activity" role="tab" aria-selected="false">Activity</button>
   </nav>
@@ -221,6 +222,32 @@
     </div>
     <div class="status-line" id="traceStatus"></div>
     <div id="traceResults"></div>
+  </div>
+
+  </div>
+
+  <div class="tab-panel" id="tab-score">
+
+  <div class="panel">
+    <div class="panel-title">Score a wallet's trading performance</div>
+    <div class="status-line" style="margin-bottom:10px;">Reconstructs realized PnL from recent swap history, FIFO cost-basis, denominated in SOL. Only round-trip trades (buy then sell) count — this answers "is this wallet actually good," not just "did they buy something once."</div>
+    <div class="add-row">
+      <input type="text" id="scoreWallet" placeholder="Wallet address to score…">
+      <button id="scoreBtn">Score wallet</button>
+    </div>
+    <div class="status-line" id="scoreStatus"></div>
+    <div id="scoreResults"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Find wallets with a cross-token track record</div>
+    <div class="status-line" style="margin-bottom:10px;">Give it several tokens that already pumped — it finds wallets that were an early buyer on more than one of them. Catching one pump early could be luck; catching three in a row is a real signal.</div>
+    <div class="add-row">
+      <input type="text" id="overlapMints" placeholder="Token addresses, comma-separated (2–6 tokens)…">
+      <button id="overlapBtn">Find overlap</button>
+    </div>
+    <div class="status-line" id="overlapStatus"></div>
+    <div id="overlapResults"></div>
   </div>
 
   </div>
@@ -439,6 +466,100 @@ $('addBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Failed to add wallet.'; statusEl.className='status-line err';
   }finally{
     $('addBtn').disabled = false;
+  }
+});
+
+$('scoreBtn').addEventListener('click', async ()=>{
+  const wallet = $('scoreWallet').value.trim();
+  const statusEl = $('scoreStatus');
+  const resultsEl = $('scoreResults');
+  resultsEl.innerHTML = '';
+  if(!wallet){ statusEl.textContent = 'Enter a wallet address.'; statusEl.className='status-line err'; return; }
+
+  $('scoreBtn').disabled = true;
+  statusEl.textContent = 'Reconstructing trade history and matching cost basis…';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/wallet-score?wallet=${encodeURIComponent(wallet)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    if(!data.totalTrades){
+      statusEl.textContent = data.note || 'No completed round-trip trades found.';
+      statusEl.className = 'status-line err';
+      return;
+    }
+
+    const winClass = data.winRate >= 50 ? 'ok' : 'err';
+    const pnlSign = data.totalPnlSol >= 0 ? '+' : '';
+    statusEl.textContent = `${data.totalTrades} closed trades found.`;
+    statusEl.className = 'status-line ok';
+
+    const usdLine = data.totalPnlUsdApprox != null
+      ? ` (~$${fmtNum(data.totalPnlUsdApprox)} at current SOL price — approximate, PnL itself is exact in SOL terms)`
+      : '';
+
+    resultsEl.innerHTML = `
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">Win rate: <span style="color:${data.winRate>=50?'var(--up)':'var(--down)'}">${data.winRate.toFixed(1)}%</span> · ${data.totalTrades} closed trades</div>
+          <div class="wallet-addr">Total PnL: ${pnlSign}${fmtNum(data.totalPnlSol)} SOL${usdLine}</div>
+          <div class="wallet-addr">Avg per trade: ${data.avgPnlSol>=0?'+':''}${fmtNum(data.avgPnlSol)} SOL · Open positions (unsold): ${data.openPositions}</div>
+          ${data.best ? `<div class="wallet-addr">Best trade: +${fmtNum(data.best.pnlSol)} SOL (${short(data.best.mint)}) · ${timeAgo(data.best.timestamp)}</div>` : ''}
+          ${data.worst ? `<div class="wallet-addr">Worst trade: ${fmtNum(data.worst.pnlSol)} SOL (${short(data.worst.mint)}) · ${timeAgo(data.worst.timestamp)}</div>` : ''}
+        </div>
+      </div>`;
+  }catch(e){
+    statusEl.textContent = 'Scoring failed.'; statusEl.className='status-line err';
+  }finally{
+    $('scoreBtn').disabled = false;
+  }
+});
+
+$('overlapBtn').addEventListener('click', async ()=>{
+  const mints = $('overlapMints').value.trim();
+  const statusEl = $('overlapStatus');
+  const resultsEl = $('overlapResults');
+  resultsEl.innerHTML = '';
+  if(!mints){ statusEl.textContent = 'Enter at least 2 token addresses, comma-separated.'; statusEl.className='status-line err'; return; }
+
+  $('overlapBtn').disabled = true;
+  statusEl.textContent = 'Scanning early buyers across all tokens… this can take a while for several tokens.';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/overlap-score?mints=${encodeURIComponent(mints)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const results = data.results || [];
+    const scannedNote = (data.tokensScanned||[]).map(t => t.symbol ? '$'+t.symbol : short(t.mint)).join(', ');
+    statusEl.textContent = `Scanned: ${scannedNote}. Found ${results.length} wallet${results.length===1?'':'s'} that bought early on 2+ of them.`;
+    statusEl.className = results.length ? 'status-line ok' : 'status-line err';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">No wallet appeared as an early buyer on more than one of these tokens.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>{
+      const tokenTags = r.tokens.map(t => {
+        const sym = t.symbol ? '$'+t.symbol : short(t.mint);
+        const botFlag = t.likelyBot ? ' ⚠' : '';
+        return `${sym}${botFlag}`;
+      }).join(', ');
+      return `
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(r.address)} · caught ${r.count} of ${(data.tokensScanned||[]).length}</div>
+          <div class="wallet-addr">${tokenTags}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`;
+    }).join('');
+  }catch(e){
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
+  }finally{
+    $('overlapBtn').disabled = false;
   }
 });
 
