@@ -5,6 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WHALE WATCH — Copytrade Tracker</title>
 <meta name="description" content="Track Solana whale wallets. Get alerted the moment they trade.">
+
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/favicon-180.png">
+
+<!-- Open Graph / link-preview tags. Replace the og:url / og:image domain
+     below with your actual deployed URL once you know it (workers.dev
+     subdomain or custom domain) — some platforms need an absolute URL to
+     fetch the preview image reliably, a relative path won't always work. -->
+<meta property="og:title" content="WHALE WATCH — Solana Copytrade Tracker">
+<meta property="og:description" content="Track Solana whale wallets. Get alerted the moment they trade.">
+<meta property="og:image" content="/og-image.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="WHALE WATCH — Solana Copytrade Tracker">
+<meta name="twitter:description" content="Track Solana whale wallets. Get alerted the moment they trade.">
+<meta name="twitter:image" content="/og-image.png">
+
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
@@ -18,7 +36,8 @@
     background-image:linear-gradient(var(--line) 1px, transparent 1px); background-size:100% 44px; background-attachment:fixed;
   }
   .wrap{max-width:820px; margin:0 auto; padding:32px 20px 80px;}
-  header{border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:24px; display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;}
+  header{border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;}
+  .hero-whale{height:68px; width:auto; flex-shrink:0; filter:drop-shadow(0 4px 14px rgba(255,107,53,0.15));}
   .brand{font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:22px; display:flex; align-items:center; gap:10px;}
   .brand .dot{width:9px; height:9px; border-radius:50%; background:var(--ink); box-shadow:0 0 10px var(--ink); animation:pulse 2s infinite;}
   @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:0.4;}}
@@ -120,6 +139,7 @@
     .tabs{gap:4px; padding:10px 0;}
     .tab-btn{font-size:12px; padding:10px 6px;}
     .brand{font-size:19px;}
+    .hero-whale{height:44px;}
     .trade-top{flex-direction:column; align-items:flex-start; gap:2px;}
   }
 </style>
@@ -127,8 +147,11 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="brand"><span class="dot"></span>WHALE WATCH</div>
-    <div class="brand-sub">Solana copytrade tracker</div>
+    <div>
+      <div class="brand"><span class="dot"></span>WHALE WATCH</div>
+      <div class="brand-sub">Solana copytrade tracker</div>
+    </div>
+    <img src="/whale.png" alt="" class="hero-whale">
   </header>
 
   <nav class="tabs" role="tablist">
