@@ -355,6 +355,92 @@ async function scanTokenHolders(mint, env){
   return { holders, totalSupply };
 }
 
+// Reconstructs realized PnL for a wallet the same way Rekt or Rich does:
+// FIFO cost-basis matching, denominated in SOL rather than USD. Only swaps
+// with a SOL leg are counted — that's how "cost" and "proceeds" get a
+// common unit without needing historical price data per trade, since the
+// SOL amount in the swap itself IS the price paid/received at that moment.
+// Token-to-token swaps (no SOL leg) are skipped for this reason; there's no
+// shared denominator to compute PnL against without a price oracle.
+//
+// Scope limitation: only the wallet's most recent `historyLimit`
+// transactions are considered, same as everywhere else in this app — this
+// is "recent form," not a lifetime audit.
+async function scoreWalletPerformance(address, env, historyLimit = 100){
+  const history = await fetchWalletHistory(address, env, historyLimit);
+  const chron = [...history].reverse(); // oldest first, needed for correct FIFO matching
+
+  const openLots = {}; // mint -> FIFO queue of { amount, costSol }
+  const closedTrades = []; // { mint, pnlSol, pnlPercent, timestamp }
+
+  for(const tx of chron){
+    if(tx.transactionError) continue;
+    const changes = detectSwap(tx, address);
+    if(!changes) continue;
+
+    const solChange = changes.find(c => c.mint === SOL_MINT);
+    if(!solChange) continue; // token-to-token swap, no common denominator — skip
+
+    const tokenChange = changes.find(c => c.mint !== SOL_MINT);
+    if(!tokenChange) continue;
+
+    if(solChange.amount < 0){
+      // Bought tokenChange.mint with SOL — open a new cost-basis lot.
+      const costSol = Math.abs(solChange.amount);
+      const amount = Math.abs(tokenChange.amount);
+      if(!openLots[tokenChange.mint]) openLots[tokenChange.mint] = [];
+      openLots[tokenChange.mint].push({ amount, costSol });
+    } else {
+      // Sold tokenChange.mint for SOL — match against open lots, FIFO.
+      const proceedsSol = solChange.amount;
+      let remaining = Math.abs(tokenChange.amount);
+      let costBasisTotal = 0;
+      const lots = openLots[tokenChange.mint];
+      if(lots && lots.length){
+        while(remaining > 0.000001 && lots.length){
+          const lot = lots[0];
+          if(lot.amount <= remaining + 0.000001){
+            costBasisTotal += lot.costSol;
+            remaining -= lot.amount;
+            lots.shift();
+          } else {
+            const portion = remaining / lot.amount;
+            const portionCost = lot.costSol * portion;
+            costBasisTotal += portionCost;
+            lot.amount -= remaining;
+            lot.costSol -= portionCost;
+            remaining = 0;
+          }
+        }
+        const pnlSol = proceedsSol - costBasisTotal;
+        const pnlPercent = costBasisTotal > 0 ? (pnlSol / costBasisTotal) * 100 : null;
+        closedTrades.push({ mint: tokenChange.mint, pnlSol, pnlPercent, timestamp: tx.timestamp });
+      }
+      // If there's no matching open lot (e.g. the buy happened before our
+      // history window), the sale is simply not scored — no invented cost
+      // basis, since that would fabricate a number we can't back up.
+    }
+  }
+
+  const totalTrades = closedTrades.length;
+  const wins = closedTrades.filter(t => t.pnlSol > 0).length;
+  const winRate = totalTrades ? (wins / totalTrades) * 100 : null;
+  const totalPnlSol = closedTrades.reduce((sum, t) => sum + t.pnlSol, 0);
+  const avgPnlSol = totalTrades ? totalPnlSol / totalTrades : null;
+  const best = totalTrades ? closedTrades.reduce((a, b) => (b.pnlSol > a.pnlSol ? b : a)) : null;
+  const worst = totalTrades ? closedTrades.reduce((a, b) => (b.pnlSol < a.pnlSol ? b : a)) : null;
+  const openPositions = Object.values(openLots).filter(lots => lots.length > 0).length;
+
+  const solPriceUsd = await getTokenPriceUsd(SOL_MINT);
+  const totalPnlUsdApprox = solPriceUsd != null ? totalPnlSol * solPriceUsd : null;
+
+  return {
+    totalTrades, winRate, totalPnlSol, avgPnlSol, best, worst,
+    openPositions, solPriceUsd, totalPnlUsdApprox,
+  };
+}
+
+
 // Finds the earliest wallets to buy a token after its creation, then
 // classifies each as likely-bot or likely-discretionary using
 // analyzeSniperBehavior. Pool/vault addresses that receive the token during
@@ -409,6 +495,51 @@ async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15
 // top holders (already filtered to real wallets, not pools/programs), then
 // checks each one for genuine swap-buys of token B. Nothing gets saved —
 // no tracking, no KV — this is purely "who overlaps" on demand.
+// Reputation scoring across several known winners: runs early-buyer
+// detection (already built above) against each token in the list, then
+// finds wallets that show up as an early buyer on more than one of them.
+// A wallet that caught several separate pumps early is a much stronger
+// signal than a single-token match — this is what actually distinguishes
+// "smart money" from "got lucky once."
+//
+// Cost scales with token count × early-buyer scan cost each, so this is
+// capped at a handful of tokens per call to keep it from timing out.
+async function scoreTokenOverlap(mints, env){
+  const tokenResults = [];
+  for(const mint of mints){
+    const [{ results: buyers }, meta] = await Promise.all([
+      findEarlyBuyers(mint, env),
+      getTokenMeta(mint),
+    ]);
+    tokenResults.push({ mint, symbol: meta.symbol, buyersFound: buyers.length, buyers });
+  }
+
+  const overlap = {};
+  for(const tr of tokenResults){
+    for(const buyer of tr.buyers){
+      if(!overlap[buyer.address]){
+        overlap[buyer.address] = { address: buyer.address, count: 0, tokens: [] };
+      }
+      overlap[buyer.address].count += 1;
+      overlap[buyer.address].tokens.push({
+        mint: tr.mint,
+        symbol: tr.symbol,
+        secondsAfterLaunch: buyer.secondsAfterLaunch,
+        likelyBot: buyer.likelyBot,
+      });
+    }
+  }
+
+  const results = Object.values(overlap)
+    .filter(w => w.count >= 2)
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    tokensScanned: tokenResults.map(t => ({ mint: t.mint, symbol: t.symbol, buyersFound: t.buyersFound })),
+    results,
+  };
+}
+
 async function scanCrossBuyers(sourceMint, targetMint, env){
   const { holders } = await scanTokenHolders(sourceMint, env);
   const whales = holders.filter(h => h.type === 'wallet');
@@ -710,6 +841,50 @@ async function handleApi(request, env){
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
       telegramConfigured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     });
+  }
+
+  if(url.pathname === '/api/wallet-score' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const wallet = (url.searchParams.get('wallet') || '').trim();
+    if(!isValidSolanaAddress(wallet)) return json({ error: 'Invalid wallet address.' }, 400);
+    try{
+      const data = await scoreWalletPerformance(wallet, env);
+      if(!data.totalTrades){
+        return json({ ...data, note: 'No completed round-trip trades found in recent history — either this wallet mostly holds, or its buys/sells fall outside the scanned window.' });
+      }
+      return json(data);
+    }catch(e){
+      console.warn('wallet-score failed', e);
+      return json({ error: 'Scoring failed. Double-check the wallet address and try again.' }, 500);
+    }
+  }
+
+  if(url.pathname === '/api/overlap-score' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const raw = (url.searchParams.get('mints') || '').trim();
+    const mints = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if(mints.length < 2) return json({ error: 'Enter at least 2 token addresses to check for overlap.' }, 400);
+    if(mints.length > 6) return json({ error: 'Max 6 tokens per scan — this keeps it from timing out.' }, 400);
+    for(const m of mints){
+      if(!isValidSolanaAddress(m)) return json({ error: `Invalid token address: ${m}` }, 400);
+    }
+    try{
+      const data = await scoreTokenOverlap(mints, env);
+      return json(data);
+    }catch(e){
+      console.warn('overlap-score failed', e);
+      return json({ error: 'Scan failed. Double-check the addresses and try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/early-buyers' && request.method === 'GET'){
