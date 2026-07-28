@@ -352,15 +352,6 @@ async function rpcCall(env, method, params){
   return data.result;
 }
 
-// Given a token mint, finds its top ~20 holder accounts and classifies each
-// as a real wallet vs. a program-controlled account (LP pool, staking
-// vault, PDA, etc.) so the UI can show actual whales instead of a list
-// that's mostly Raydium/Pump.fun pool addresses.
-//
-// The classification trick: every ordinary wallet's on-chain account is
-// owned by the System Program. Pool vaults, staking accounts, and other
-// PDAs are owned by whatever program created them. Checking that one field
-// is enough to tell "trader" from "infrastructure" without guessing.
 // Same wallet-vs-program-account check used in scanTokenHolders, pulled out
 // standalone so early-buyer detection can reuse it without re-scanning
 // holders — pool/vault addresses show up as "buyers" in raw transfer data
@@ -376,6 +367,15 @@ async function classifyOwners(addresses, env){
   return map;
 }
 
+// Given a token mint, finds its top ~20 holder accounts and classifies each
+// as a real wallet vs. a program-controlled account (LP pool, staking
+// vault, PDA, etc.) so the UI can show actual whales instead of a list
+// that's mostly Raydium/Pump.fun pool addresses.
+//
+// The classification trick: every ordinary wallet's on-chain account is
+// owned by the System Program. Pool vaults, staking accounts, and other
+// PDAs are owned by whatever program created them. Checking that one field
+// is enough to tell "trader" from "infrastructure" without guessing.
 async function scanTokenHolders(mint, env){
   const largest = await rpcCall(env, 'getTokenLargestAccounts', [mint]);
   const tokenAccounts = (largest?.value || []).filter(a => Number(a.amount) > 0);
@@ -572,19 +572,6 @@ async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15
   return { creationTimestamp, results };
 }
 
-// One-shot version of the whale-scan + buyer-check combo: finds token A's
-// top holders (already filtered to real wallets, not pools/programs), then
-// checks each one for genuine swap-buys of token B. Nothing gets saved —
-// no tracking, no KV — this is purely "who overlaps" on demand.
-// Reputation scoring across several known winners: runs early-buyer
-// detection (already built above) against each token in the list, then
-// finds wallets that show up as an early buyer on more than one of them.
-// A wallet that caught several separate pumps early is a much stronger
-// signal than a single-token match — this is what actually distinguishes
-// "smart money" from "got lucky once."
-//
-// Cost scales with token count × early-buyer scan cost each, so this is
-// capped at a handful of tokens per call to keep it from timing out.
 // Checks several known-winner tokens at once and finds wallets that show
 // up as a real (non-pool/program) holder across multiple of them — a
 // wallet holding 3 of 5 given winners is a much stronger signal than one
@@ -624,6 +611,10 @@ async function scoreTokenOverlap(mints, env){
   };
 }
 
+// One-shot version of the whale-scan + buyer-check combo: finds token A's
+// top holders (already filtered to real wallets, not pools/programs), then
+// checks each one for genuine swap-buys of token B. Nothing gets saved —
+// no tracking, no KV — this is purely "who overlaps" on demand.
 async function scanCrossBuyers(sourceMint, targetMint, env){
   const { holders } = await scanTokenHolders(sourceMint, env);
   const whales = holders.filter(h => h.type === 'wallet');
