@@ -98,9 +98,10 @@ async function saveTrades(env, trades){
 // Works for any address, not just wallets — a token mint's own address has
 // a transaction history too (every transfer/swap involving it), which is
 // how the early-buyer scan below works.
-async function fetchAddressTransactions(address, env, { limit = 25, sortOrder } = {}){
+async function fetchAddressTransactions(address, env, { limit = 25, sortOrder, before } = {}){
   let url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?api-key=${env.HELIUS_API_KEY}&limit=${limit}`;
   if(sortOrder) url += `&sort-order=${sortOrder}`;
+  if(before) url += `&before=${before}`;
   try{
     const res = await fetch(url);
     if(!res.ok){
@@ -113,6 +114,26 @@ async function fetchAddressTransactions(address, env, { limit = 25, sortOrder } 
     console.warn(`Helius history fetch threw for ${address}:`, e);
     return [];
   }
+}
+
+// Helius caps a single call at 100 transactions. For a deeper look, this
+// pages backward: fetch the first 100, then ask for the next batch "before"
+// the oldest signature seen so far, repeating until `limit` is reached or
+// the wallet runs out of history. Only used when a depth beyond 100 is
+// actually requested — the common 100-tx case stays a single call.
+async function fetchWalletHistoryPaged(address, env, limit = 100){
+  if(limit <= 100) return fetchWalletHistory(address, env, limit);
+
+  let all = await fetchAddressTransactions(address, env, { limit: 100 });
+  while(all.length < limit){
+    const lastSig = all[all.length - 1]?.signature;
+    if(!lastSig) break;
+    const remaining = limit - all.length;
+    const next = await fetchAddressTransactions(address, env, { limit: Math.min(remaining, 100), before: lastSig });
+    if(!next.length) break; // wallet has no more history to page through
+    all = all.concat(next);
+  }
+  return all;
 }
 
 async function fetchWalletHistory(address, env, limit = 25){
@@ -404,7 +425,7 @@ async function scanTokenHolders(mint, env){
 // transactions are considered, same as everywhere else in this app — this
 // is "recent form," not a lifetime audit.
 async function scoreWalletPerformance(address, env, historyLimit = 100){
-  const history = await fetchWalletHistory(address, env, historyLimit);
+  const history = await fetchWalletHistoryPaged(address, env, historyLimit);
   const chron = [...history].reverse(); // oldest first, needed for correct FIFO matching
 
   const openLots = {}; // mint -> FIFO queue of { amount, costSol }
@@ -474,6 +495,7 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
   return {
     totalTrades, winRate, totalPnlSol, avgPnlSol, best, worst,
     openPositions, solPriceUsd, totalPnlUsdApprox,
+    historyDepth: historyLimit, transactionsScanned: history.length,
   };
 }
 
@@ -483,11 +505,11 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
 // checking wallets one at a time. Reuses scoreWalletPerformance exactly,
 // so a wallet's numbers here always match what the single-wallet Score
 // tool would show for the same wallet.
-async function scoreAllTrackedWallets(env){
+async function scoreAllTrackedWallets(env, historyLimit = 100){
   const wallets = await getWallets(env);
   const results = [];
   for(const wallet of wallets){
-    const score = await scoreWalletPerformance(wallet.address, env);
+    const score = await scoreWalletPerformance(wallet.address, env, historyLimit);
     results.push({ address: wallet.address, label: wallet.label || null, ...score });
   }
   // Rank by USD PnL when available (falls back to SOL PnL). Wallets with
@@ -951,8 +973,10 @@ async function handleApi(request, env){
     }
     const wallet = (url.searchParams.get('wallet') || '').trim();
     if(!isValidSolanaAddress(wallet)) return json({ error: 'Invalid wallet address.' }, 400);
+    const depthParam = parseInt(url.searchParams.get('depth') || '100', 10);
+    const depth = depthParam === 200 ? 200 : 100; // only these two are offered in the UI
     try{
-      const data = await scoreWalletPerformance(wallet, env);
+      const data = await scoreWalletPerformance(wallet, env, depth);
       if(!data.totalTrades){
         return json({ ...data, note: 'No completed round-trip trades found in recent history — either this wallet mostly holds, or its buys/sells fall outside the scanned window.' });
       }
@@ -1130,8 +1154,10 @@ async function handleApi(request, env){
     if(!env.HELIUS_API_KEY){
       return json({ error: "HELIUS_API_KEY isn't set yet." }, 500);
     }
+    const depthParam = parseInt(url.searchParams.get('depth') || '100', 10);
+    const depth = depthParam === 200 ? 200 : 100;
     try{
-      const data = await scoreAllTrackedWallets(env);
+      const data = await scoreAllTrackedWallets(env, depth);
       return json(data);
     }catch(e){
       console.warn('leaderboard failed', e);
