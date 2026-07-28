@@ -312,6 +312,14 @@
   </div>
 
   <div class="panel">
+    <div class="panel-title">Leaderboard</div>
+    <div class="status-line" style="margin-bottom:10px;">Scores every tracked wallet at once (same FIFO PnL logic as the Score tool) and ranks them by realized profit — who's actually good, out of everyone you're watching.</div>
+    <button id="leaderboardBtn">Rank tracked wallets</button>
+    <div class="status-line" id="leaderboardStatus"></div>
+    <div id="leaderboardResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Find buyers among tracked wallets</div>
     <div class="add-row">
       <input type="text" id="buyersMint" placeholder="Token contract to check for buys…">
@@ -459,8 +467,9 @@ async function loadTrades(){
       const tag = t.eventLabel ? ` · ${t.eventLabel}` : '';
       const tokenLabel = t.tokenSymbol ? `$${t.tokenSymbol}` : (t.tokenMint ? short(t.tokenMint) : null);
       const usdTag = t.usdValue != null ? ` · ~$${fmtNum(t.usdValue)}` : '';
+      const mcTag = t.marketCap != null ? ` · MC ~$${fmtNum(t.marketCap)}` : '';
       const tokenLine = tokenLabel
-        ? `<div class="wallet-addr" style="margin-bottom:4px;">${tokenLabel}${t.tokenName ? ' ('+t.tokenName+')' : ''}${usdTag}${t.tokenMint ? ' · CA: '+t.tokenMint : ''}</div>`
+        ? `<div class="wallet-addr" style="margin-bottom:4px;">${tokenLabel}${t.tokenName ? ' ('+t.tokenName+')' : ''}${usdTag}${mcTag}${t.tokenMint ? ' · CA: '+t.tokenMint : ''}</div>`
         : '';
       return `<div class="trade-row">
         <div class="trade-top">
@@ -845,6 +854,53 @@ $('crossBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
   }finally{
     $('crossBtn').disabled = false;
+  }
+});
+
+$('leaderboardBtn').addEventListener('click', async ()=>{
+  const statusEl = $('leaderboardStatus');
+  const resultsEl = $('leaderboardResults');
+  resultsEl.innerHTML = '';
+  $('leaderboardBtn').disabled = true;
+  statusEl.textContent = 'Scoring every tracked wallet… this can take a bit for a full list.';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch('/api/leaderboard');
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const results = data.results || [];
+    statusEl.textContent = `Scored ${data.walletsScored} tracked wallet${data.walletsScored===1?'':'s'}.`;
+    statusEl.className = 'status-line ok';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">No tracked wallets yet — add some first.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map((r, i)=>{
+      if(!r.totalTrades){
+        return `<div class="wallet-row">
+          <div>
+            <div class="wallet-name">#${i+1} ${r.label || short(r.address)}</div>
+            <div class="wallet-addr">No closed trades in recent history</div>
+          </div>
+        </div>`;
+      }
+      const pnlClass = r.totalPnlSol >= 0 ? 'up' : 'down';
+      const pnlUsd = r.totalPnlUsdApprox != null ? ' (~$'+fmtNum(r.totalPnlUsdApprox)+')' : '';
+      return `<div class="wallet-row">
+        <div>
+          <div class="wallet-name">#${i+1} ${r.label || short(r.address)} · ${r.winRate.toFixed(0)}% win rate</div>
+          <div class="wallet-addr"><span class="amt ${pnlClass}">${r.totalPnlSol>=0?'+':''}${fmtNum(r.totalPnlSol)} SOL</span>${pnlUsd} · ${r.totalTrades} trades</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`;
+    }).join('');
+  }catch(e){
+    statusEl.textContent = 'Scoring failed.'; statusEl.className='status-line err';
+  }finally{
+    $('leaderboardBtn').disabled = false;
   }
 });
 
