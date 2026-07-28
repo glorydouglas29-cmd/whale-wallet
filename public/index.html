@@ -600,7 +600,7 @@ $('scoreBtn').addEventListener('click', async ()=>{
           <div class="wallet-name">Win rate: <span style="color:${data.winRate>=50?'var(--up)':'var(--down)'}">${data.winRate.toFixed(1)}%</span> · ${data.totalTrades} closed trades</div>
           <div class="wallet-addr">Total PnL: ${pnlSign}${fmtNum(data.totalPnlSol)} SOL${usdLine}</div>
           <div class="wallet-addr">Avg per trade: ${data.avgPnlSol>=0?'+':''}${fmtNum(data.avgPnlSol)} SOL · Open positions (unsold): ${data.openPositions}</div>
-          ${data.best ? `<div class="wallet-addr">Best trade: +${fmtNum(data.best.pnlSol)} SOL (${short(data.best.mint)}) · ${timeAgo(data.best.timestamp)}</div>` : ''}
+          ${data.best ? `<div class="wallet-addr">Best trade: ${data.best.pnlSol>=0?'+':''}${fmtNum(data.best.pnlSol)} SOL (${short(data.best.mint)}) · ${timeAgo(data.best.timestamp)}</div>` : ''}
           ${data.worst ? `<div class="wallet-addr">Worst trade: ${fmtNum(data.worst.pnlSol)} SOL (${short(data.worst.mint)}) · ${timeAgo(data.worst.timestamp)}</div>` : ''}
         </div>
       </div>`;
