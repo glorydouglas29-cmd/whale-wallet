@@ -275,6 +275,10 @@
     <div class="status-line" style="margin-bottom:10px;">Reconstructs realized PnL from recent swap history, FIFO cost-basis, denominated in SOL. Only round-trip trades (buy then sell) count — this answers "is this wallet actually good," not just "did they buy something once."</div>
     <div class="add-row">
       <input type="text" id="scoreWallet" placeholder="Wallet address to score…">
+      <select id="scoreDepth">
+        <option value="100" selected>Last 100 tx</option>
+        <option value="200">Last 200 tx</option>
+      </select>
       <button id="scoreBtn">Score wallet</button>
     </div>
     <div class="status-line" id="scoreStatus"></div>
@@ -314,7 +318,13 @@
   <div class="panel">
     <div class="panel-title">Leaderboard</div>
     <div class="status-line" style="margin-bottom:10px;">Scores every tracked wallet at once (same FIFO PnL logic as the Score tool) and ranks them by realized profit — who's actually good, out of everyone you're watching.</div>
-    <button id="leaderboardBtn">Rank tracked wallets</button>
+    <div class="add-row">
+      <select id="leaderboardDepth">
+        <option value="100" selected>Last 100 tx each</option>
+        <option value="200">Last 200 tx each (slower)</option>
+      </select>
+      <button id="leaderboardBtn">Rank tracked wallets</button>
+    </div>
     <div class="status-line" id="leaderboardStatus"></div>
     <div id="leaderboardResults"></div>
   </div>
@@ -544,16 +554,17 @@ $('addBtn').addEventListener('click', async ()=>{
 
 $('scoreBtn').addEventListener('click', async ()=>{
   const wallet = $('scoreWallet').value.trim();
+  const depth = $('scoreDepth').value;
   const statusEl = $('scoreStatus');
   const resultsEl = $('scoreResults');
   resultsEl.innerHTML = '';
   if(!wallet){ statusEl.textContent = 'Enter a wallet address.'; statusEl.className='status-line err'; return; }
 
   $('scoreBtn').disabled = true;
-  statusEl.textContent = 'Reconstructing trade history and matching cost basis…';
+  statusEl.textContent = `Reconstructing trade history and matching cost basis (last ${depth} tx)…`;
   statusEl.className = 'status-line';
   try{
-    const res = await fetch(`/api/wallet-score?wallet=${encodeURIComponent(wallet)}`);
+    const res = await fetch(`/api/wallet-score?wallet=${encodeURIComponent(wallet)}&depth=${depth}`);
     const data = await res.json();
     if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
 
@@ -858,14 +869,15 @@ $('crossBtn').addEventListener('click', async ()=>{
 });
 
 $('leaderboardBtn').addEventListener('click', async ()=>{
+  const depth = $('leaderboardDepth').value;
   const statusEl = $('leaderboardStatus');
   const resultsEl = $('leaderboardResults');
   resultsEl.innerHTML = '';
   $('leaderboardBtn').disabled = true;
-  statusEl.textContent = 'Scoring every tracked wallet… this can take a bit for a full list.';
+  statusEl.textContent = `Scoring every tracked wallet (last ${depth} tx each)… this can take a bit for a full list.`;
   statusEl.className = 'status-line';
   try{
-    const res = await fetch('/api/leaderboard');
+    const res = await fetch(`/api/leaderboard?depth=${depth}`);
     const data = await res.json();
     if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
 
