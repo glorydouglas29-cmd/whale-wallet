@@ -186,6 +186,37 @@ function formatUsd(value){
   return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: value < 1 ? 6 : 2 });
 }
 
+// Compact form for large numbers in alert messages — "$1.24M" instead of
+// "$1,240,000.00", since market caps get unwieldy fast and alerts need to
+// stay scannable at a glance.
+function formatCompactUsd(value){
+  if(value == null) return null;
+  const abs = Math.abs(value);
+  if(abs >= 1e9) return '$' + (value / 1e9).toFixed(2) + 'B';
+  if(abs >= 1e6) return '$' + (value / 1e6).toFixed(2) + 'M';
+  if(abs >= 1e3) return '$' + (value / 1e3).toFixed(1) + 'K';
+  return '$' + value.toFixed(2);
+}
+
+// Rough market cap: current price × total supply. This is fully-diluted
+// valuation, not strictly circulating market cap — for most memecoins
+// (no vesting/locked supply) the two are close enough to be useful, but
+// for a token with significant locked/vested supply this will read high.
+// Not applied to SOL itself — "market cap of SOL" isn't the useful number
+// in a whale-alert context, so it's skipped for that mint.
+async function getTokenMarketCap(mint, env){
+  if(mint === SOL_MINT) return null;
+  try{
+    const [supplyResult, price] = await Promise.all([
+      rpcCall(env, 'getTokenSupply', [mint]),
+      getTokenPriceUsd(mint),
+    ]);
+    const supply = Number(supplyResult?.value?.uiAmount || 0);
+    if(!supply || price == null) return null;
+    return supply * price;
+  }catch(e){ return null; }
+}
+
 // Same Jupiter Price API v3 used elsewhere in the degen suite (Rekt or
 // Rich). Free lite endpoint, no key needed. Returns null on any failure so
 // a price hiccup degrades to "show token amounts only" instead of erroring
@@ -447,6 +478,28 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
 }
 
 
+// Scores every tracked wallet at once and ranks by realized PnL — the
+// "who's actually good, out of everyone I'm watching" view, instead of
+// checking wallets one at a time. Reuses scoreWalletPerformance exactly,
+// so a wallet's numbers here always match what the single-wallet Score
+// tool would show for the same wallet.
+async function scoreAllTrackedWallets(env){
+  const wallets = await getWallets(env);
+  const results = [];
+  for(const wallet of wallets){
+    const score = await scoreWalletPerformance(wallet.address, env);
+    results.push({ address: wallet.address, label: wallet.label || null, ...score });
+  }
+  // Rank by USD PnL when available (falls back to SOL PnL). Wallets with
+  // zero closed trades sort to the bottom rather than cluttering the top.
+  results.sort((a, b) => {
+    const aVal = a.totalTrades ? (a.totalPnlUsdApprox ?? a.totalPnlSol) : -Infinity;
+    const bVal = b.totalTrades ? (b.totalPnlUsdApprox ?? b.totalPnlSol) : -Infinity;
+    return bVal - aVal;
+  });
+  return { results, walletsScored: wallets.length };
+}
+
 // Finds the earliest wallets to buy a token after its creation, then
 // classifies each as likely-bot or likely-discretionary using
 // analyzeSniperBehavior. Pool/vault addresses that receive the token during
@@ -705,23 +758,55 @@ function formatChangeLines(changes){
 // amount, and USD value if a price was resolved. context = { asset, meta,
 // usdValue }, all optional — gracefully degrades to just the mint if
 // Jupiter didn't recognize the token.
-function buildTokenBlock(context, { markdown }){
-  const { asset, meta, usdValue } = context || {};
+// Telegram's HTML parse mode only needs these three characters escaped —
+// much simpler and more reliable than MarkdownV2, which requires escaping
+// a long list of punctuation everywhere outside code blocks. Applied to
+// any dynamic text (wallet labels, token names) that isn't already known
+// to be safe, so a label with a stray "&" or "<" in it can't break the
+// whole message's formatting.
+function escapeTelegramHtml(str){
+  if(str == null) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Builds the shared "here's the coin" block for both alert channels.
+// format: 'discord' uses Discord's markdown (backticks still copyable
+// there via long-press/select, which was never the complaint). format:
+// 'telegram' uses real HTML <code> tags for the CA specifically — that's
+// what gives Telegram's one-tap-to-copy behavior, versus plain text which
+// only supports press-and-hold-to-select.
+function buildTokenBlock(context, { format }){
+  const { asset, meta, usdValue, marketCap } = context || {};
   if(!asset) return '';
-  const symbolText = meta?.symbol ? `$${meta.symbol}` : shortAddr(asset.mint);
-  const symbol = markdown ? `**${symbolText}**` : symbolText;
-  const nameLine = meta?.name ? ` (${meta.name})` : '';
-  const caLine = asset.mint === SOL_MINT ? '' : `\nCA: ${markdown ? '`'+asset.mint+'`' : asset.mint}`;
-  const amt = `${asset.amount > 0 ? '+' : '-'}${Math.abs(asset.amount).toLocaleString(undefined,{maximumFractionDigits:4})}${meta?.symbol ? ' '+meta.symbol : ''}`;
+  const isTelegram = format === 'telegram';
+  const isDiscord = format === 'discord';
+
+  const symbolRaw = meta?.symbol ? `$${meta.symbol}` : shortAddr(asset.mint);
+  const symbolText = isTelegram ? escapeTelegramHtml(symbolRaw) : symbolRaw;
+  const symbol = isDiscord ? `**${symbolText}**` : (isTelegram ? `<b>${symbolText}</b>` : symbolText);
+
+  const nameRaw = meta?.name ? ` (${meta.name})` : '';
+  const nameLine = isTelegram ? escapeTelegramHtml(nameRaw) : nameRaw;
+
+  let caLine = '';
+  if(asset.mint !== SOL_MINT){
+    if(isDiscord) caLine = `\nCA: \`${asset.mint}\``;
+    else if(isTelegram) caLine = `\nCA: <code>${asset.mint}</code>`; // one-tap copy in Telegram
+    else caLine = `\nCA: ${asset.mint}`;
+  }
+
+  const symbolSuffix = meta?.symbol ? ' ' + (isTelegram ? escapeTelegramHtml(meta.symbol) : meta.symbol) : '';
+  const amt = `${asset.amount > 0 ? '+' : '-'}${Math.abs(asset.amount).toLocaleString(undefined,{maximumFractionDigits:4})}${symbolSuffix}`;
   const usd = usdValue != null ? ` (~$${formatUsd(usdValue)})` : '';
-  return `${symbol}${nameLine}${caLine}\n${amt}${usd}\n\n`;
+  const mcLine = marketCap != null ? `\nMC: ~${formatCompactUsd(marketCap)}` : '';
+  return `${symbol}${nameLine}${caLine}\n${amt}${usd}${mcLine}\n\n`;
 }
 
 async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.DISCORD_WEBHOOK_URL) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
   const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
-  const tokenBlock = buildTokenBlock(context, { markdown: true });
+  const tokenBlock = buildTokenBlock(context, { format: 'discord' });
   const lines = formatChangeLines(changes);
   const content = `🐋 **Whale ${verb}** ${emoji}\n**${walletLabel(wallet)}**\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
@@ -738,18 +823,24 @@ async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true, context
 // via @BotFather, get its token, then get your chat ID by messaging the
 // bot once and checking https://api.telegram.org/bot<TOKEN>/getUpdates (or
 // using a helper bot like @userinfobot for your personal chat ID).
+//
+// Sent with parse_mode: HTML so the CA renders as a <code> span — in the
+// Telegram app that's a single tap to copy, not press-and-hold-to-select
+// like plain text. Everything outside the CA/symbol is HTML-escaped since
+// wallet labels are user-set text that could otherwise break the parser.
 async function sendTelegramAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
   const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
-  const tokenBlock = buildTokenBlock(context, { markdown: false });
-  const lines = formatChangeLines(changes);
-  const text = `${emoji} Whale ${verb}\n${walletLabel(wallet)}\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const tokenBlock = buildTokenBlock(context, { format: 'telegram' });
+  const lines = escapeTelegramHtml(formatChangeLines(changes));
+  const walletLine = escapeTelegramHtml(walletLabel(wallet));
+  const text = `${emoji} Whale ${verb}\n${walletLine}\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text }),
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
     });
   }catch(e){ console.warn('Telegram alert failed', e); }
 }
@@ -784,17 +875,18 @@ async function pollWallets(env){
         if(swapChanges){
           const { label } = classifyEvent(swapChanges, true);
           const asset = primaryAsset(swapChanges, label);
-          const [meta, price] = await Promise.all([
+          const [meta, price, marketCap] = await Promise.all([
             getTokenMeta(asset.mint),
             getTokenPriceUsd(asset.mint),
+            getTokenMarketCap(asset.mint, env),
           ]);
           const usdValue = price != null ? Math.abs(asset.amount) * price : null;
-          const context = { asset, meta, usdValue };
+          const context = { asset, meta, usdValue, marketCap };
 
           trades.unshift({
             wallet: wallet.address, label: wallet.label || null,
             kind: 'swap', eventLabel: label,
-            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue,
+            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue, marketCap,
             signature: tx.signature, timestamp: tx.timestamp,
             changes: swapChanges.map(c=>({ mint: c.mint, amount: c.amount })),
           });
@@ -811,17 +903,18 @@ async function pollWallets(env){
         if(transferChanges.length){
           const { label } = classifyEvent(transferChanges, false);
           const asset = primaryAsset(transferChanges, label);
-          const [meta, price] = await Promise.all([
+          const [meta, price, marketCap] = await Promise.all([
             getTokenMeta(asset.mint),
             getTokenPriceUsd(asset.mint),
+            getTokenMarketCap(asset.mint, env),
           ]);
           const usdValue = price != null ? Math.abs(asset.amount) * price : null;
-          const context = { asset, meta, usdValue };
+          const context = { asset, meta, usdValue, marketCap };
 
           trades.unshift({
             wallet: wallet.address, label: wallet.label || null,
             kind: 'transfer', eventLabel: label,
-            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue,
+            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue, marketCap,
             signature: tx.signature, timestamp: tx.timestamp,
             changes: transferChanges.map(c=>({ mint: c.mint, amount: c.amount })),
           });
@@ -1028,6 +1121,22 @@ async function handleApi(request, env){
     await saveWallets(env, wallets);
     await env.TRACKER_KV.delete(`lastseen:${address}`);
     return json({ wallets });
+  }
+
+  if(url.pathname === '/api/leaderboard' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet." }, 500);
+    }
+    try{
+      const data = await scoreAllTrackedWallets(env);
+      return json(data);
+    }catch(e){
+      console.warn('leaderboard failed', e);
+      return json({ error: 'Scoring failed. Try again.' }, 500);
+    }
   }
 
   if(url.pathname === '/api/find-buyers' && request.method === 'GET'){
