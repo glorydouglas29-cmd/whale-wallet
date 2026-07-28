@@ -1,5 +1,5 @@
 {
-  "name": "whale-copytrade-tracker",
+  "name": "whale-wallet",
   "compatibility_date": "2026-07-22",
   "main": "src/worker.js",
   "assets": {
