@@ -585,29 +585,32 @@ async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15
 //
 // Cost scales with token count × early-buyer scan cost each, so this is
 // capped at a handful of tokens per call to keep it from timing out.
+// Checks several known-winner tokens at once and finds wallets that show
+// up as a real (non-pool/program) holder across multiple of them — a
+// wallet holding 3 of 5 given winners is a much stronger signal than one
+// that holds just one. Uses current top-holder snapshots (same filtering
+// as whale-scan), not "earliest post-launch buyer" — that population is
+// dominated by snipers/bots and misses genuine holders who bought a bit
+// later but still built a real position, which is what actually matters
+// for a reputation check.
 async function scoreTokenOverlap(mints, env){
-  const tokenResults = [];
-  for(const mint of mints){
-    const [{ results: buyers }, meta] = await Promise.all([
-      findEarlyBuyers(mint, env),
+  const tokenResults = await Promise.all(mints.map(async mint => {
+    const [{ holders }, meta] = await Promise.all([
+      scanTokenHolders(mint, env),
       getTokenMeta(mint),
     ]);
-    tokenResults.push({ mint, symbol: meta.symbol, buyersFound: buyers.length, buyers });
-  }
+    const wallets = holders.filter(h => h.type === 'wallet');
+    return { mint, symbol: meta.symbol, buyersFound: wallets.length, wallets };
+  }));
 
   const overlap = {};
   for(const tr of tokenResults){
-    for(const buyer of tr.buyers){
-      if(!overlap[buyer.address]){
-        overlap[buyer.address] = { address: buyer.address, count: 0, tokens: [] };
+    for(const w of tr.wallets){
+      if(!overlap[w.address]){
+        overlap[w.address] = { address: w.address, count: 0, tokens: [] };
       }
-      overlap[buyer.address].count += 1;
-      overlap[buyer.address].tokens.push({
-        mint: tr.mint,
-        symbol: tr.symbol,
-        secondsAfterLaunch: buyer.secondsAfterLaunch,
-        likelyBot: buyer.likelyBot,
-      });
+      overlap[w.address].count += 1;
+      overlap[w.address].tokens.push({ mint: tr.mint, symbol: tr.symbol, pctSupply: w.pctSupply });
     }
   }
 
@@ -888,7 +891,7 @@ async function pollWallets(env){
       if(tx.signature === lastSeenSig) break;
       newTxs.push(tx);
     }
-    if(lastSeenSig){
+    if(lastSeenSig && !wallet.paused){
       newTxs.reverse();
       for(const tx of newTxs){
         if(tx.transactionError) continue;
@@ -1144,6 +1147,21 @@ async function handleApi(request, env){
     wallets = wallets.filter(w=>w.address!==address);
     await saveWallets(env, wallets);
     await env.TRACKER_KV.delete(`lastseen:${address}`);
+    return json({ wallets });
+  }
+
+  if(url.pathname === '/api/wallets/pause' && request.method === 'POST'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    const body = await request.json().catch(()=>({}));
+    const address = (body.address||'').trim();
+    const paused = !!body.paused;
+    const wallets = await getWallets(env);
+    const wallet = wallets.find(w=>w.address===address);
+    if(!wallet) return json({ error: 'Wallet not found in tracked list.' }, 404);
+    wallet.paused = paused;
+    await saveWallets(env, wallets);
     return json({ wallets });
   }
 
