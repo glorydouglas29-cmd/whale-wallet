@@ -146,8 +146,14 @@ function walletChanges(tx, address){
 function detectSwap(tx, address){
   const changes = walletChanges(tx, address);
   if(tx.type === 'SWAP') return changes.length ? changes : null;
-  if(!tx.type || tx.type === 'UNKNOWN') return changes.length >= 2 ? changes : null;
-  return null;
+  // Helius's type tag isn't reliable for every routed swap — a multi-hop
+  // trade (e.g. SOL -> USDC -> TOKEN through an aggregator) can come back
+  // tagged as something other than SWAP even though the wallet's net
+  // change is unmistakably "spent one asset, received another" (the
+  // intermediate leg nets to zero and drops out of walletChanges already).
+  // Trust that pattern regardless of what Helius labeled the tx as, not
+  // only when the type is missing or UNKNOWN.
+  return changes.length >= 2 ? changes : null;
 }
 
 function shortAddr(addr){
