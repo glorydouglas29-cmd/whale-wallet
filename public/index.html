@@ -287,7 +287,7 @@
 
   <div class="panel">
     <div class="panel-title">Find wallets with a cross-token track record</div>
-    <div class="status-line" style="margin-bottom:10px;">Give it several tokens that already pumped — it finds wallets that were an early buyer on more than one of them. Catching one pump early could be luck; catching three in a row is a real signal.</div>
+    <div class="status-line" style="margin-bottom:10px;">Give it several tokens that already pumped — it finds wallets that currently hold more than one of them. Catching one pump could be luck; holding three winners in a row is a real signal.</div>
     <div class="add-row">
       <input type="text" id="overlapMints" placeholder="Token addresses, comma-separated (2–6 tokens)…">
       <button id="overlapBtn">Find overlap</button>
@@ -439,17 +439,28 @@ async function loadWallets(){
     const wallets = data.wallets || [];
     if(!wallets.length){ el.innerHTML = `<div class="empty">No wallets tracked yet — add one above.</div>`; return; }
     el.innerHTML = wallets.map(w=>`
-      <div class="wallet-row">
+      <div class="wallet-row"${w.paused ? ' style="opacity:0.55;"' : ''}>
         <div>
-          <div class="wallet-name">${w.label || short(w.address)}</div>
+          <div class="wallet-name">${w.label || short(w.address)}${w.paused ? ' · <span style="color:var(--gold);">paused</span>' : ''}</div>
           <div class="wallet-addr">${w.address}</div>
         </div>
-        <button class="danger" data-addr="${w.address}">remove</button>
+        <div style="display:flex; gap:6px; flex-shrink:0;">
+          <button class="ghost" data-pause="${w.address}" data-paused="${w.paused ? 'true' : 'false'}">${w.paused ? 'Resume' : 'Pause'}</button>
+          <button class="danger" data-addr="${w.address}">remove</button>
+        </div>
       </div>`).join('');
     el.querySelectorAll('button[data-addr]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
         btn.disabled = true;
         await fetch('/api/wallets', { method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify({address: btn.dataset.addr}) });
+        loadWallets();
+      });
+    });
+    el.querySelectorAll('button[data-pause]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        btn.disabled = true;
+        const nowPaused = btn.dataset.paused !== 'true';
+        await fetch('/api/wallets/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({address: btn.dataset.pause, paused: nowPaused}) });
         loadWallets();
       });
     });
@@ -608,7 +619,7 @@ $('overlapBtn').addEventListener('click', async ()=>{
   if(!mints){ statusEl.textContent = 'Enter at least 2 token addresses, comma-separated.'; statusEl.className='status-line err'; return; }
 
   $('overlapBtn').disabled = true;
-  statusEl.textContent = 'Scanning early buyers across all tokens… this can take a while for several tokens.';
+  statusEl.textContent = 'Scanning current holders across all tokens… this can take a while for several tokens.';
   statusEl.className = 'status-line';
   try{
     const res = await fetch(`/api/overlap-score?mints=${encodeURIComponent(mints)}`);
@@ -617,24 +628,23 @@ $('overlapBtn').addEventListener('click', async ()=>{
 
     const results = data.results || [];
     const scannedNote = (data.tokensScanned||[]).map(t => t.symbol ? '$'+t.symbol : short(t.mint)).join(', ');
-    statusEl.textContent = `Scanned: ${scannedNote}. Found ${results.length} wallet${results.length===1?'':'s'} that bought early on 2+ of them.`;
+    statusEl.textContent = `Scanned: ${scannedNote}. Found ${results.length} wallet${results.length===1?'':'s'} holding 2+ of them.`;
     statusEl.className = results.length ? 'status-line ok' : 'status-line err';
 
     if(!results.length){
-      resultsEl.innerHTML = `<div class="empty">No wallet appeared as an early buyer on more than one of these tokens.</div>`;
+      resultsEl.innerHTML = `<div class="empty">No wallet appears as a real holder across more than one of these tokens.</div>`;
       return;
     }
 
     resultsEl.innerHTML = results.map(r=>{
       const tokenTags = r.tokens.map(t => {
         const sym = t.symbol ? '$'+t.symbol : short(t.mint);
-        const botFlag = t.likelyBot ? ' ⚠' : '';
-        return `${sym}${botFlag}`;
+        return `${sym} (${t.pctSupply.toFixed(2)}%)`;
       }).join(', ');
       return `
       <div class="wallet-row">
         <div>
-          <div class="wallet-name">${short(r.address)} · caught ${r.count} of ${(data.tokensScanned||[]).length}</div>
+          <div class="wallet-name">${short(r.address)} · holds ${r.count} of ${(data.tokensScanned||[]).length}</div>
           <div class="wallet-addr">${tokenTags}</div>
         </div>
         <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
