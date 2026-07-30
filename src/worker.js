@@ -818,13 +818,26 @@ function buildTokenBlock(context, { format }){
   return `${symbol}${nameLine}${caLine}\n${amt}${usd}${mcLine}\n\n`;
 }
 
+// Maps an event label to the natural verb used in the alert header —
+// "Papoi bought" reads better than "Whale BUY detected / Papoi".
+function actionVerb(label){
+  switch(label){
+    case 'BUY': return 'bought';
+    case 'SELL': return 'sold';
+    case 'SWAP': return 'swapped';
+    case 'SENT': return 'sent';
+    case 'RECEIVED': return 'received';
+    default: return 'moved';
+  }
+}
+
 async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.DISCORD_WEBHOOK_URL) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
-  const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const verb = actionVerb(label);
   const tokenBlock = buildTokenBlock(context, { format: 'discord' });
   const lines = formatChangeLines(changes);
-  const content = `🐋 **Whale ${verb}** ${emoji}\n**${walletLabel(wallet)}**\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const content = `🐋 ${emoji} **${walletLabel(wallet)} ${verb}**\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(env.DISCORD_WEBHOOK_URL, {
       method: 'POST',
@@ -847,11 +860,11 @@ async function sendDiscordAlert(env, wallet, tx, changes, isSwap = true, context
 async function sendTelegramAlert(env, wallet, tx, changes, isSwap = true, context = {}){
   if(!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const { label, emoji } = classifyEvent(changes, isSwap);
-  const verb = isSwap ? `${label} detected` : (label === 'SENT' ? 'sent a transfer' : 'received a transfer');
+  const verb = actionVerb(label);
   const tokenBlock = buildTokenBlock(context, { format: 'telegram' });
   const lines = escapeTelegramHtml(formatChangeLines(changes));
   const walletLine = escapeTelegramHtml(walletLabel(wallet));
-  const text = `${emoji} Whale ${verb}\n${walletLine}\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
+  const text = `🐋 ${emoji} <b>${walletLine} ${verb}</b>\n\n${tokenBlock}${lines}\nhttps://solscan.io/tx/${tx.signature}`;
   try{
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
