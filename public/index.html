@@ -488,7 +488,15 @@ async function loadTrades(){
       const tag = t.eventLabel ? ` · ${t.eventLabel}` : '';
       const tokenLabel = t.tokenSymbol ? `$${t.tokenSymbol}` : (t.tokenMint ? short(t.tokenMint) : null);
       const usdTag = t.usdValue != null ? ` · ~$${fmtNum(t.usdValue)}` : '';
-      const mcTag = t.marketCap != null ? ` · MC ~$${fmtNum(t.marketCap)}` : '';
+      let mcTag = '';
+      if(t.entryMarketCap != null && t.marketCap != null){
+        const pct = t.entryMarketCap > 0 ? ((t.marketCap - t.entryMarketCap) / t.entryMarketCap) * 100 : null;
+        const trend = t.marketCap >= t.entryMarketCap ? '📈' : '📉';
+        const pctText = pct != null ? ` (${pct>=0?'+':''}${pct.toFixed(1)}%)` : '';
+        mcTag = ` · MC $${fmtNum(t.entryMarketCap)} → $${fmtNum(t.marketCap)} ${trend}${pctText}`;
+      } else if(t.marketCap != null){
+        mcTag = ` · MC ~$${fmtNum(t.marketCap)}`;
+      }
       const tokenLine = tokenLabel
         ? `<div class="wallet-addr" style="margin-bottom:4px;">${tokenLabel}${t.tokenName ? ' ('+t.tokenName+')' : ''}${usdTag}${mcTag}${t.tokenMint ? ' · CA: '+t.tokenMint : ''}</div>`
         : '';
