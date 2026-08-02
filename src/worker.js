@@ -216,10 +216,26 @@ async function fetchWalletHistory(address, env, limit = 25){
 // multiple transfers of the same mint within one tx into a single line.
 function walletChanges(tx, address){
   const totals = {};
-  for(const nt of tx.nativeTransfers || []){
-    if(nt.fromUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) - nt.amount / 1e9;
-    if(nt.toUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) + nt.amount / 1e9;
+
+  // SOL: prefer accountData's nativeBalanceChange — the actual net lamport
+  // delta for this account (computed from real before/after balances), not
+  // a manual sum of individual transfer instructions. Some AMM programs
+  // (Pump.fun's post-migration pool is one) settle SOL through the pool
+  // contract in a way that doesn't fully show up as enumerable
+  // nativeTransfers entries, while a small separate fee/tip transfer does —
+  // summing nativeTransfers alone can end up picking up just the fee and
+  // completely missing the actual trade proceeds. accountData can't have
+  // that gap, since it isn't counting individual legs at all.
+  const acctEntry = (tx.accountData || []).find(a => a.account === address);
+  if(acctEntry && typeof acctEntry.nativeBalanceChange === 'number' && acctEntry.nativeBalanceChange !== 0){
+    totals[SOL_MINT] = acctEntry.nativeBalanceChange / 1e9;
+  } else {
+    for(const nt of tx.nativeTransfers || []){
+      if(nt.fromUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) - nt.amount / 1e9;
+      if(nt.toUserAccount === address) totals[SOL_MINT] = (totals[SOL_MINT]||0) + nt.amount / 1e9;
+    }
   }
+
   for(const tt of tx.tokenTransfers || []){
     const mint = tt.mint;
     if(!mint) continue;
