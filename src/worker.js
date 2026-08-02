@@ -73,6 +73,51 @@ async function checkRateLimit(request, env){
   return true;
 }
 
+// Runs a list of async tasks with a concurrency cap — a middle ground
+// between fully sequential (slow enough to hit Cloudflare's execution
+// time limit on anything scanning 15+ wallets) and fully parallel (risks
+// tripping Helius's own rate limits when 20+ requests fire at once, which
+// would silently return empty results for some wallets rather than a
+// clean error). Returns Promise.allSettled-shaped results so callers can
+// tell which tasks actually succeeded.
+async function runWithConcurrency(items, limit, task){
+  const results = new Array(items.length);
+  let index = 0;
+  async function worker(){
+    while(index < items.length){
+      const i = index++;
+      try{
+        results[i] = { status: 'fulfilled', value: await task(items[i], i) };
+      }catch(e){
+        results[i] = { status: 'rejected', reason: e };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// Short-lived KV cache for external API lookups (Jupiter price/metadata).
+// These get called constantly — every alert, every scan, every score —
+// often for the exact same token within seconds of each other (e.g. one
+// poll cycle alerting on the same pumping token across several tracked
+// wallets). Caching cuts that down to one real request instead of N,
+// which reduces how often this app can trip Helius's or Jupiter's own
+// rate limits in the first place. Fails open (just calls fetcher directly)
+// if KV isn't configured yet, so this never blocks anything from working.
+async function getCached(env, key, ttlSeconds, fetcher){
+  if(!env.TRACKER_KV) return fetcher();
+  try{
+    const cached = await env.TRACKER_KV.get(key);
+    if(cached !== null) return JSON.parse(cached);
+  }catch(e){ /* corrupt/missing cache entry — fall through to a fresh fetch */ }
+  const value = await fetcher();
+  try{
+    await env.TRACKER_KV.put(key, JSON.stringify(value), { expirationTtl: ttlSeconds });
+  }catch(e){ /* caching is a nice-to-have, never let it block the response */ }
+  return value;
+}
+
 async function getWallets(env){
   const raw = await env.TRACKER_KV.get('wallets');
   return raw ? JSON.parse(raw) : [];
@@ -86,6 +131,32 @@ async function getTrades(env){
 }
 async function saveTrades(env, trades){
   await env.TRACKER_KV.put('trades', JSON.stringify(trades.slice(0, MAX_TRADES_STORED)));
+}
+
+// Remembers the market cap at the moment a tracked wallet buys a token, so
+// that when it later sells the same token, the alert can show the full
+// trajectory ("bought at $86K MC, sold at $210K MC") instead of just the
+// exit price in isolation — a much faster "did this actually work out"
+// signal than reading raw SOL amounts. Overwritten on every new buy of the
+// same mint, so it always reflects the most recent entry point rather than
+// trying to track multiple partial positions. 30-day TTL so long-abandoned
+// entries don't accumulate forever in KV.
+async function getEntryMarketCap(env, wallet, mint){
+  if(!env.TRACKER_KV) return null;
+  try{
+    const raw = await env.TRACKER_KV.get(`entrymc:${wallet}:${mint}`);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+async function setEntryMarketCap(env, wallet, mint, marketCap, timestamp){
+  if(!env.TRACKER_KV || marketCap == null) return;
+  try{
+    await env.TRACKER_KV.put(
+      `entrymc:${wallet}:${mint}`,
+      JSON.stringify({ mc: marketCap, timestamp }),
+      { expirationTtl: 60 * 60 * 24 * 30 }
+    );
+  }catch(e){ /* best-effort — a missed write just means no trajectory shown on the next sell */ }
 }
 
 // Helius's old v1/wallet/history endpoint (Enhanced Transactions API) is
@@ -191,15 +262,17 @@ function walletLabel(wallet){
 // no API key needed on this tier). SOL is hardcoded since it's not worth a
 // lookup. Falls back to nulls on any failure so a metadata hiccup never
 // blocks an alert from sending — the alert just shows the raw mint instead.
-async function getTokenMeta(mint){
+async function getTokenMeta(mint, env){
   if(mint === SOL_MINT) return { symbol: 'SOL', name: 'Solana' };
-  try{
-    const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${mint}`);
-    if(!res.ok) return { symbol: null, name: null };
-    const data = await res.json();
-    const match = Array.isArray(data) ? (data.find(t => t.address === mint) || data[0]) : null;
-    return match ? { symbol: match.symbol || null, name: match.name || null } : { symbol: null, name: null };
-  }catch(e){ return { symbol: null, name: null }; }
+  return getCached(env, `meta:${mint}`, 3600, async () => {
+    try{
+      const res = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${mint}`);
+      if(!res.ok) return { symbol: null, name: null };
+      const data = await res.json();
+      const match = Array.isArray(data) ? (data.find(t => t.address === mint) || data[0]) : null;
+      return match ? { symbol: match.symbol || null, name: match.name || null } : { symbol: null, name: null };
+    }catch(e){ return { symbol: null, name: null }; }
+  });
 }
 
 function formatUsd(value){
@@ -230,7 +303,7 @@ async function getTokenMarketCap(mint, env){
   try{
     const [supplyResult, price] = await Promise.all([
       rpcCall(env, 'getTokenSupply', [mint]),
-      getTokenPriceUsd(mint),
+      getTokenPriceUsd(mint, env),
     ]);
     const supply = Number(supplyResult?.value?.uiAmount || 0);
     if(!supply || price == null) return null;
@@ -242,13 +315,15 @@ async function getTokenMarketCap(mint, env){
 // Rich). Free lite endpoint, no key needed. Returns null on any failure so
 // a price hiccup degrades to "show token amounts only" instead of erroring
 // out the whole scan.
-async function getTokenPriceUsd(mint){
-  try{
-    const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${mint}`);
-    if(!res.ok) return null;
-    const data = await res.json();
-    return data?.[mint]?.usdPrice ?? null;
-  }catch(e){ return null; }
+async function getTokenPriceUsd(mint, env){
+  return getCached(env, `price:${mint}`, 25, async () => {
+    try{
+      const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${mint}`);
+      if(!res.ok) return null;
+      const data = await res.json();
+      return data?.[mint]?.usdPrice ?? null;
+    }catch(e){ return null; }
+  });
 }
 
 // Rough bot/sniper signal: walks a wallet's recent swap history in
@@ -316,22 +391,23 @@ async function checkWalletBought(address, targetMint, env, historyLimit = 50){
 
 // Flat version: checks a given list of wallets against one target mint.
 async function findMintBuyers(wallets, targetMint, env){
-  const priceUsd = await getTokenPriceUsd(targetMint);
-  const results = [];
+  const priceUsd = await getTokenPriceUsd(targetMint, env);
 
-  for(const wallet of wallets){
-    const bought = await checkWalletBought(wallet.address, targetMint, env);
-    if(bought){
-      results.push({
-        address: wallet.address,
-        label: wallet.label || null,
-        totalBought: bought.totalBought,
-        valueUsd: priceUsd != null ? bought.totalBought * priceUsd : null,
-        buyCount: bought.buyCount,
-        lastBuyTimestamp: bought.lastBuyTimestamp,
-      });
-    }
-  }
+  const settled = await runWithConcurrency(wallets, 5, wallet => checkWalletBought(wallet.address, targetMint, env));
+
+  const results = [];
+  wallets.forEach((wallet, i) => {
+    if(settled[i].status !== 'fulfilled' || !settled[i].value) return;
+    const bought = settled[i].value;
+    results.push({
+      address: wallet.address,
+      label: wallet.label || null,
+      totalBought: bought.totalBought,
+      valueUsd: priceUsd != null ? bought.totalBought * priceUsd : null,
+      buyCount: bought.buyCount,
+      lastBuyTimestamp: bought.lastBuyTimestamp,
+    });
+  });
 
   results.sort((a, b) => (b.valueUsd ?? b.totalBought) - (a.valueUsd ?? a.totalBought));
   return { results, priceUsd, scannedWallets: wallets.length };
@@ -472,7 +548,10 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
         }
         const pnlSol = proceedsSol - costBasisTotal;
         const pnlPercent = costBasisTotal > 0 ? (pnlSol / costBasisTotal) * 100 : null;
-        closedTrades.push({ mint: tokenChange.mint, pnlSol, pnlPercent, timestamp: tx.timestamp });
+        closedTrades.push({
+          mint: tokenChange.mint, pnlSol, pnlPercent, timestamp: tx.timestamp,
+          amount: Math.abs(tokenChange.amount), costBasisTotal, proceedsSol,
+        });
       }
       // If there's no matching open lot (e.g. the buy happened before our
       // history window), the sale is simply not scored — no invented cost
@@ -489,8 +568,32 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
   const worst = totalTrades ? closedTrades.reduce((a, b) => (b.pnlSol < a.pnlSol ? b : a)) : null;
   const openPositions = Object.values(openLots).filter(lots => lots.length > 0).length;
 
-  const solPriceUsd = await getTokenPriceUsd(SOL_MINT);
+  const solPriceUsd = await getTokenPriceUsd(SOL_MINT, env);
   const totalPnlUsdApprox = solPriceUsd != null ? totalPnlSol * solPriceUsd : null;
+
+  // Back into an approximate entry/exit market cap for the highlighted
+  // trades — same idea as the live alert trajectory, just reconstructed
+  // after the fact from the trade's own SOL amounts instead of tracked in
+  // real time. Uses today's SOL price and today's token supply for both
+  // sides of the same trade, which means the resulting % change is
+  // mathematically the same number as pnlPercent above — this isn't new
+  // information, just a more concrete, tangible way to see it ($86K -> 
+  // $210K reads faster than "+144%"). Only computed for best/worst, not
+  // every trade, to keep this cheap regardless of history depth.
+  const tradesToEnrich = best === worst ? [best] : [best, worst].filter(Boolean);
+  for(const trade of tradesToEnrich){
+    trade.entryMarketCap = null;
+    trade.exitMarketCap = null;
+    if(solPriceUsd == null || !trade.amount) continue;
+    try{
+      const supplyResult = await rpcCall(env, 'getTokenSupply', [trade.mint]);
+      const supply = Number(supplyResult?.value?.uiAmount || 0);
+      if(supply > 0){
+        trade.entryMarketCap = (trade.costBasisTotal / trade.amount) * solPriceUsd * supply;
+        trade.exitMarketCap = (trade.proceedsSol / trade.amount) * solPriceUsd * supply;
+      }
+    }catch(e){ /* leave nulls — trade still shows, just without the MC line */ }
+  }
 
   return {
     totalTrades, winRate, totalPnlSol, avgPnlSol, best, worst,
@@ -507,11 +610,15 @@ async function scoreWalletPerformance(address, env, historyLimit = 100){
 // tool would show for the same wallet.
 async function scoreAllTrackedWallets(env, historyLimit = 100){
   const wallets = await getWallets(env);
+
+  const settled = await runWithConcurrency(wallets, 5, wallet => scoreWalletPerformance(wallet.address, env, historyLimit));
+
   const results = [];
-  for(const wallet of wallets){
-    const score = await scoreWalletPerformance(wallet.address, env, historyLimit);
-    results.push({ address: wallet.address, label: wallet.label || null, ...score });
-  }
+  wallets.forEach((wallet, i) => {
+    if(settled[i].status !== 'fulfilled') return;
+    results.push({ address: wallet.address, label: wallet.label || null, ...settled[i].value });
+  });
+
   // Rank by USD PnL when available (falls back to SOL PnL). Wallets with
   // zero closed trades sort to the bottom rather than cluttering the top.
   results.sort((a, b) => {
@@ -558,16 +665,25 @@ async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15
     .filter(([addr]) => ownerType[addr] === 'wallet')
     .slice(0, maxCandidates);
 
+  // Run all candidates' sniper analysis in parallel instead of one at a
+  // time — sequential awaiting here meant up to 15 full history fetches
+  // stacked end to end, easily enough to hit Cloudflare's execution time
+  // limit on a token with a lot of early activity. Promise.allSettled also
+  // means one candidate's failure can't take the whole scan down with it;
+  // it's just dropped from the results instead. Bounded to 5 at once so it
+  // doesn't trip Helius's own rate limits on a token with many candidates.
+  const settled = await runWithConcurrency(wallets, 5, ([address]) => analyzeSniperBehavior(address, env));
+
   const results = [];
-  for(const [address, info] of wallets){
-    const behavior = await analyzeSniperBehavior(address, env);
+  wallets.forEach(([address, info], i) => {
+    if(settled[i].status !== 'fulfilled') return;
     results.push({
       address,
       secondsAfterLaunch: creationTimestamp != null ? info.timestamp - creationTimestamp : null,
       amountBought: info.amount,
-      ...behavior,
+      ...settled[i].value,
     });
-  }
+  });
 
   return { creationTimestamp, results };
 }
@@ -584,7 +700,7 @@ async function scoreTokenOverlap(mints, env){
   const tokenResults = await Promise.all(mints.map(async mint => {
     const [{ holders }, meta] = await Promise.all([
       scanTokenHolders(mint, env),
-      getTokenMeta(mint),
+      getTokenMeta(mint, env),
     ]);
     const wallets = holders.filter(h => h.type === 'wallet');
     return { mint, symbol: meta.symbol, buyersFound: wallets.length, wallets };
@@ -729,7 +845,7 @@ async function traceLineageForBuyers(rootWallet, targetMint, env, opts = {}){
     currentLevel = nextLevel;
   }
 
-  const priceUsd = await getTokenPriceUsd(targetMint);
+  const priceUsd = await getTokenPriceUsd(targetMint, env);
   const results = Object.values(foundBuyers)
     .map(r => ({ ...r, valueUsd: priceUsd != null ? r.totalBought * priceUsd : null }))
     .sort((a, b) => (b.valueUsd ?? b.totalBought) - (a.valueUsd ?? a.totalBought));
@@ -792,7 +908,7 @@ function escapeTelegramHtml(str){
 // what gives Telegram's one-tap-to-copy behavior, versus plain text which
 // only supports press-and-hold-to-select.
 function buildTokenBlock(context, { format }){
-  const { asset, meta, usdValue, marketCap } = context || {};
+  const { asset, meta, usdValue, marketCap, entryMarketCap } = context || {};
   if(!asset) return '';
   const isTelegram = format === 'telegram';
   const isDiscord = format === 'discord';
@@ -814,7 +930,20 @@ function buildTokenBlock(context, { format }){
   const symbolSuffix = meta?.symbol ? ' ' + (isTelegram ? escapeTelegramHtml(meta.symbol) : meta.symbol) : '';
   const amt = `${asset.amount > 0 ? '+' : '-'}${Math.abs(asset.amount).toLocaleString(undefined,{maximumFractionDigits:4})}${symbolSuffix}`;
   const usd = usdValue != null ? ` (~$${formatUsd(usdValue)})` : '';
-  const mcLine = marketCap != null ? `\nMC: ~${formatCompactUsd(marketCap)}` : '';
+
+  let mcLine = '';
+  if(entryMarketCap != null && marketCap != null){
+    // Selling a token we saw this wallet buy — show the full trajectory,
+    // not just the exit price. This is the "did it actually work out"
+    // signal at a glance.
+    const pctChange = entryMarketCap > 0 ? ((marketCap - entryMarketCap) / entryMarketCap) * 100 : null;
+    const trend = marketCap >= entryMarketCap ? '📈' : '📉';
+    const pctText = pctChange != null ? ` (${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(1)}%)` : '';
+    mcLine = `\nMC: ${formatCompactUsd(entryMarketCap)} → ${formatCompactUsd(marketCap)} ${trend}${pctText}`;
+  } else if(marketCap != null){
+    mcLine = `\nMC: ~${formatCompactUsd(marketCap)}`;
+  }
+
   return `${symbol}${nameLine}${caLine}\n${amt}${usd}${mcLine}\n\n`;
 }
 
@@ -905,17 +1034,29 @@ async function pollWallets(env){
           const { label } = classifyEvent(swapChanges, true);
           const asset = primaryAsset(swapChanges, label);
           const [meta, price, marketCap] = await Promise.all([
-            getTokenMeta(asset.mint),
-            getTokenPriceUsd(asset.mint),
+            getTokenMeta(asset.mint, env),
+            getTokenPriceUsd(asset.mint, env),
             getTokenMarketCap(asset.mint, env),
           ]);
           const usdValue = price != null ? Math.abs(asset.amount) * price : null;
-          const context = { asset, meta, usdValue, marketCap };
+
+          // Track entry MC across buy/sell pairs — only meaningful for
+          // clean SOL<->token swaps (BUY/SELL), not token-to-token SWAPs
+          // where "entry" isn't a single well-defined price.
+          let entryMarketCap = null;
+          if(label === 'BUY'){
+            await setEntryMarketCap(env, wallet.address, asset.mint, marketCap, tx.timestamp);
+          } else if(label === 'SELL'){
+            const entry = await getEntryMarketCap(env, wallet.address, asset.mint);
+            entryMarketCap = entry ? entry.mc : null;
+          }
+
+          const context = { asset, meta, usdValue, marketCap, entryMarketCap };
 
           trades.unshift({
             wallet: wallet.address, label: wallet.label || null,
             kind: 'swap', eventLabel: label,
-            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue, marketCap,
+            tokenMint: asset.mint, tokenSymbol: meta.symbol, tokenName: meta.name, usdValue, marketCap, entryMarketCap,
             signature: tx.signature, timestamp: tx.timestamp,
             changes: swapChanges.map(c=>({ mint: c.mint, amount: c.amount })),
           });
@@ -933,8 +1074,8 @@ async function pollWallets(env){
           const { label } = classifyEvent(transferChanges, false);
           const asset = primaryAsset(transferChanges, label);
           const [meta, price, marketCap] = await Promise.all([
-            getTokenMeta(asset.mint),
-            getTokenPriceUsd(asset.mint),
+            getTokenMeta(asset.mint, env),
+            getTokenPriceUsd(asset.mint, env),
             getTokenMarketCap(asset.mint, env),
           ]);
           const usdValue = price != null ? Math.abs(asset.amount) * price : null;
