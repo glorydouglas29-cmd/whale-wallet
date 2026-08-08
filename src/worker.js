@@ -67,10 +67,19 @@ async function checkRateLimit(request, env){
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const windowId = Math.floor(Date.now() / 1000 / RATE_LIMIT_WINDOW_SEC);
   const key = `ratelimit:${ip}:${windowId}`;
-  const current = parseInt(await env.TRACKER_KV.get(key) || '0', 10);
-  if(current >= RATE_LIMIT_MAX_REQUESTS) return false;
-  await env.TRACKER_KV.put(key, String(current + 1), { expirationTtl: RATE_LIMIT_WINDOW_SEC * 2 });
-  return true;
+  try{
+    const current = parseInt(await env.TRACKER_KV.get(key) || '0', 10);
+    if(current >= RATE_LIMIT_MAX_REQUESTS) return false;
+    await env.TRACKER_KV.put(key, String(current + 1), { expirationTtl: RATE_LIMIT_WINDOW_SEC * 2 });
+    return true;
+  }catch(e){
+    // Rate limiting is a safety net, not core functionality — if KV can't
+    // be read/written (e.g. the daily write quota is exhausted), fail open
+    // and let the request through rather than taking down every feature
+    // in the app over a nice-to-have.
+    console.warn('checkRateLimit failed, allowing request:', e);
+    return true;
+  }
 }
 
 // Runs a list of async tasks with a concurrency cap — a middle ground
@@ -1110,7 +1119,23 @@ async function pollWallets(env){
       }
     }
 
-    await env.TRACKER_KV.put(`lastseen:${wallet.address}`, history[0].signature);
+    // Only write lastseen when it actually changed. Writing unconditionally
+    // every cycle was the single biggest source of KV writes in the whole
+    // app — with a 5-minute cron across up to 25 wallets, that's up to
+    // 7,200 writes/day from this one line alone, several times over
+    // Cloudflare KV's free-tier daily write quota, even on days with very
+    // little real trading activity to report.
+    if(history[0].signature !== lastSeenSig){
+      try{
+        await env.TRACKER_KV.put(`lastseen:${wallet.address}`, history[0].signature);
+      }catch(e){
+        // If the daily KV write quota is exhausted, don't let it crash the
+        // rest of the poll loop — just skip updating for this wallet this
+        // cycle. It'll catch up once quota resets or the next successful
+        // write goes through.
+        console.warn(`lastseen write failed for ${wallet.address}:`, e);
+      }
+    }
   }
 
   await saveTrades(env, trades);
@@ -1388,7 +1413,16 @@ export default {
       return new Response('', { status: 200, headers: CORS_HEADERS });
     }
     if(url.pathname.startsWith('/api/')){
-      return handleApi(request, env);
+      try{
+        return await handleApi(request, env);
+      }catch(e){
+        console.error('Unhandled error in handleApi:', e);
+        const isQuotaError = e && typeof e.message === 'string' && e.message.toLowerCase().includes('limit exceeded');
+        const message = isQuotaError
+          ? "Daily storage quota reached (Cloudflare KV's free tier caps writes per day). This clears on its own within about 24 hours — or upgrade to Workers Paid to remove the cap entirely."
+          : 'Something went wrong on the server. Try again in a moment.';
+        return json({ error: message }, 500);
+      }
     }
     return env.ASSETS.fetch(request);
   },
