@@ -344,6 +344,13 @@
   <div class="tab-panel" id="tab-activity">
 
   <div class="panel">
+    <div class="panel-title">Automatic polling</div>
+    <div class="status-line" style="margin-bottom:10px;">Controls the background scan that checks every tracked wallet every 5 minutes — this is what actually costs Helius credits continuously, whether or not you're looking at the site. Turn this off if you're tracking wallets somewhere else (e.g. GMGN) and just want this list here as a reference. <strong style="color:var(--paper);">"Poll now" below and every Discover/Score tool still work on demand either way</strong> — this only gates the unattended background scan.</div>
+    <div class="status-line" id="pollingStatus">Checking…</div>
+    <button id="pollingToggleBtn" disabled>Checking…</button>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Recent trades</div>
     <div id="tradeList"><div class="empty">Loading…</div></div>
     <div style="text-align:center; margin-top:14px;">
@@ -523,11 +530,13 @@ async function loadDiscordStatus(){
     if(!data.kvConfigured){
       $('discordStatus').textContent = 'KV namespace not set up yet — see Worker Settings → Bindings.';
       $('telegramStatus').textContent = 'KV namespace not set up yet — see Worker Settings → Bindings.';
+      $('pollingStatus').textContent = 'KV namespace not set up yet — see Worker Settings → Bindings.';
       return;
     }
     if(!data.heliusConfigured){
       $('discordStatus').textContent = 'HELIUS_API_KEY not set yet — polling won\'t work until it is.';
       $('telegramStatus').textContent = 'HELIUS_API_KEY not set yet — polling won\'t work until it is.';
+      $('pollingStatus').textContent = 'HELIUS_API_KEY not set yet — polling won\'t work until it is.';
       return;
     }
 
@@ -544,11 +553,43 @@ async function loadDiscordStatus(){
     } else {
       $('telegramStatus').textContent = 'Not set yet — you just won\'t get Telegram pings.';
     }
+
+    setPollingUi(data.pollingEnabled);
   }catch(e){
     $('discordStatus').textContent = 'Could not check status.';
+    $('pollingStatus').textContent = 'Could not check status.';
     $('telegramStatus').textContent = 'Could not check status.';
   }
 }
+
+function setPollingUi(enabled){
+  const btn = $('pollingToggleBtn');
+  btn.disabled = false;
+  btn.dataset.enabled = enabled ? 'true' : 'false';
+  btn.textContent = enabled ? 'Turn off automatic polling' : 'Turn on automatic polling';
+  $('pollingStatus').textContent = enabled
+    ? 'ON — checking every tracked wallet every 5 minutes.'
+    : 'OFF — tracked wallets are just a reference list. No automatic scans, no alerts firing on their own. Manual tools below still work anytime.';
+  $('pollingStatus').className = enabled ? 'status-line ok' : 'status-line';
+}
+
+$('pollingToggleBtn').addEventListener('click', async ()=>{
+  const currentlyEnabled = $('pollingToggleBtn').dataset.enabled === 'true';
+  $('pollingToggleBtn').disabled = true;
+  try{
+    const res = await fetch('/api/polling-toggle', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ enabled: !currentlyEnabled }),
+    });
+    const data = await res.json();
+    if(data.error){ $('pollingStatus').textContent = data.error; $('pollingStatus').className = 'status-line err'; $('pollingToggleBtn').disabled = false; return; }
+    setPollingUi(data.pollingEnabled);
+  }catch(e){
+    $('pollingStatus').textContent = 'Failed to update — try again.';
+    $('pollingStatus').className = 'status-line err';
+    $('pollingToggleBtn').disabled = false;
+  }
+});
 
 $('addBtn').addEventListener('click', async ()=>{
   const address = $('addAddr').value.trim();
