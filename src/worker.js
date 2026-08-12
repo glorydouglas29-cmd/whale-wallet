@@ -142,6 +142,24 @@ async function saveTrades(env, trades){
   await env.TRACKER_KV.put('trades', JSON.stringify(trades.slice(0, MAX_TRADES_STORED)));
 }
 
+// On/off switch for the background 5-minute cron. Defaults to ON (true)
+// when never explicitly set, so existing deployments keep working exactly
+// as before unless someone deliberately turns this off — e.g. to use the
+// Tracked list as a plain reference (tracking elsewhere, like GMGN) without
+// burning Helius/KV usage on an automatic scan nobody's acting on. The
+// "Poll now" button and every on-demand Discover/Score tool are
+// intentionally unaffected by this — this only gates the unattended cron.
+async function getPollingEnabled(env){
+  if(!env.TRACKER_KV) return true;
+  try{
+    const raw = await env.TRACKER_KV.get('pollingEnabled');
+    return raw === null ? true : raw === 'true';
+  }catch(e){ return true; }
+}
+async function setPollingEnabled(env, enabled){
+  await env.TRACKER_KV.put('pollingEnabled', enabled ? 'true' : 'false');
+}
+
 // Remembers the market cap at the moment a tracked wallet buys a token, so
 // that when it later sells the same token, the alert can show the full
 // trajectory ("bought at $86K MC, sold at $210K MC") instead of just the
@@ -1150,6 +1168,7 @@ async function handleApi(request, env){
       heliusConfigured: !!env.HELIUS_API_KEY,
       discordConfigured: !!env.DISCORD_WEBHOOK_URL,
       telegramConfigured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+      pollingEnabled: await getPollingEnabled(env),
     });
   }
 
@@ -1301,6 +1320,16 @@ async function handleApi(request, env){
     return json({ error: "TRACKER_KV binding isn't set up yet. Add a KV namespace binding named TRACKER_KV in this Worker's Settings -> Bindings." }, 500);
   }
 
+  if(url.pathname === '/api/polling-toggle' && request.method === 'POST'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    const body = await request.json().catch(()=>({}));
+    const enabled = !!body.enabled;
+    await setPollingEnabled(env, enabled);
+    return json({ pollingEnabled: enabled });
+  }
+
   if(url.pathname === '/api/wallets' && request.method === 'GET'){
     return json({ wallets: await getWallets(env) });
   }
@@ -1428,6 +1457,10 @@ export default {
   },
 
   async scheduled(event, env, ctx){
-    ctx.waitUntil(pollWallets(env));
+    ctx.waitUntil((async () => {
+      const enabled = await getPollingEnabled(env);
+      if(!enabled) return; // background scanning turned off — costs nothing beyond this one read
+      await pollWallets(env);
+    })());
   },
 };
