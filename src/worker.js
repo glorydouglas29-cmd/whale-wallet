@@ -731,6 +731,85 @@ async function findEarlyBuyers(mint, env, { earlyLimit = 100, maxCandidates = 15
   return { creationTimestamp, results };
 }
 
+const GECKOTERMINAL_BASE = 'https://api.geckoterminal.com/api/v2';
+
+// GeckoTerminal's public API is free and keyless, but rate-limited to
+// roughly 10 requests/min on that tier — fine for an occasional manual
+// button click, not for anything automated or repeated in a loop. It's
+// also officially in beta, so DEX naming/response shape could shift
+// without notice; everything here reads defensively (returns fewer/no
+// results rather than throwing) so a format change degrades gracefully
+// instead of breaking the whole feature.
+//
+// Finds the DEX id(s) matching "pump" on Solana — covers both the
+// bonding-curve DEX and the post-migration PumpSwap AMM, since a token
+// that already pumped could be trading on either by the time this runs.
+async function findPumpDexIds(){
+  try{
+    const res = await fetch(`${GECKOTERMINAL_BASE}/networks/solana/dexes`);
+    if(!res.ok) return [];
+    const data = await res.json();
+    const list = Array.isArray(data?.data) ? data.data : [];
+    return list
+      .filter(d => (d?.attributes?.name || '').toLowerCase().includes('pump'))
+      .map(d => d.id);
+  }catch(e){ return []; }
+}
+
+async function fetchPoolsForDex(dexId){
+  try{
+    const res = await fetch(`${GECKOTERMINAL_BASE}/networks/solana/dexes/${dexId}/pools?include=base_token`);
+    if(!res.ok) return { pools: [], tokens: {} };
+    const data = await res.json();
+    const pools = Array.isArray(data?.data) ? data.data : [];
+    const tokens = {};
+    for(const inc of data?.included || []){
+      if(inc.type === 'token') tokens[inc.id] = inc.attributes;
+    }
+    return { pools, tokens };
+  }catch(e){ return { pools: [], tokens: {} }; }
+}
+
+// Finds up to maxTokens Pump.fun-origin tokens currently above
+// minMarketCap, ranked by market cap. Market cap here comes straight from
+// GeckoTerminal (falls back to FDV if GeckoTerminal hasn't verified
+// circulating supply for a token) — same "fully-diluted-ish" caveat as
+// the rest of this app's own market cap numbers.
+async function findPumpedTokens(minMarketCap, maxTokens = 5){
+  const dexIds = await findPumpDexIds();
+  if(!dexIds.length){
+    return { tokens: [], note: "Couldn't identify Pump.fun on GeckoTerminal right now — its DEX listing may have changed, or the API is temporarily unavailable." };
+  }
+
+  let allPools = [];
+  let allTokens = {};
+  for(const dexId of dexIds){
+    const { pools, tokens } = await fetchPoolsForDex(dexId);
+    allPools = allPools.concat(pools);
+    allTokens = { ...allTokens, ...tokens };
+  }
+
+  const candidates = [];
+  for(const pool of allPools){
+    const mc = parseFloat(pool?.attributes?.market_cap_usd ?? pool?.attributes?.fdv_usd ?? 'NaN');
+    if(!Number.isFinite(mc) || mc < minMarketCap) continue;
+    const baseTokenRef = pool?.relationships?.base_token?.data?.id;
+    const tokenAttrs = baseTokenRef ? allTokens[baseTokenRef] : null;
+    const mint = tokenAttrs?.address;
+    if(!mint) continue;
+    candidates.push({ mint, symbol: tokenAttrs.symbol || null, name: tokenAttrs.name || null, marketCap: mc });
+  }
+
+  // Same token can have more than one pool — dedupe, keeping the highest
+  // market cap reading seen for it.
+  const byMint = {};
+  for(const c of candidates){
+    if(!byMint[c.mint] || c.marketCap > byMint[c.mint].marketCap) byMint[c.mint] = c;
+  }
+  const tokens = Object.values(byMint).sort((a, b) => b.marketCap - a.marketCap).slice(0, maxTokens);
+  return { tokens };
+}
+
 // Checks several known-winner tokens at once and finds wallets that show
 // up as a real (non-pool/program) holder across multiple of them — a
 // wallet holding 3 of 5 given winners is a much stronger signal than one
@@ -768,6 +847,22 @@ async function scoreTokenOverlap(mints, env){
     tokensScanned: tokenResults.map(t => ({ mint: t.mint, symbol: t.symbol, buyersFound: t.buyersFound })),
     results,
   };
+}
+
+// Combines the two: find up to 5 pump.fun tokens above a market cap
+// threshold, then check which wallets hold 2+ of them — automating what
+// would otherwise be manually pasting winner addresses into the overlap
+// tool above.
+async function findPumpedOverlap(minMarketCapUsd, env){
+  const { tokens, note } = await findPumpedTokens(minMarketCapUsd, 5);
+  if(tokens.length < 2){
+    return {
+      tokensFound: tokens, tokensScanned: [], results: [],
+      note: note || `Found ${tokens.length} pump.fun token${tokens.length===1?'':'s'} above this market cap — need at least 2 to check overlap. Try a lower threshold.`,
+    };
+  }
+  const overlap = await scoreTokenOverlap(tokens.map(t => t.mint), env);
+  return { tokensFound: tokens, ...overlap };
 }
 
 // One-shot version of the whale-scan + buyer-check combo: finds token A's
@@ -1215,6 +1310,24 @@ async function handleApi(request, env){
     }catch(e){
       console.warn('overlap-score failed', e);
       return json({ error: 'Scan failed. Double-check the addresses and try again.' }, 500);
+    }
+  }
+
+  if(url.pathname === '/api/pumped-overlap' && request.method === 'GET'){
+    if(!(await checkRateLimit(request, env))){
+      return json({ error: 'Too many requests. Try again in a minute.' }, 429);
+    }
+    if(!env.HELIUS_API_KEY){
+      return json({ error: "HELIUS_API_KEY isn't set yet. Add it in Settings -> Variables and Secrets." }, 500);
+    }
+    const minMc = parseFloat(url.searchParams.get('minMc') || '');
+    if(!minMc || minMc <= 0) return json({ error: 'Enter a market cap threshold above 0.' }, 400);
+    try{
+      const data = await findPumpedOverlap(minMc, env);
+      return json(data);
+    }catch(e){
+      console.warn('pumped-overlap failed', e);
+      return json({ error: 'Scan failed — GeckoTerminal (the data source for pump.fun tokens) may be temporarily unavailable. Try again shortly.' }, 500);
     }
   }
 
