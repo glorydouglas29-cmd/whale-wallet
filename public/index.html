@@ -286,6 +286,17 @@
   </div>
 
   <div class="panel">
+    <div class="panel-title">Auto-find pumped tokens & check overlap</div>
+    <div class="status-line" style="margin-bottom:10px;">Finds up to 5 pump.fun tokens above a market cap threshold, then automatically checks which wallets hold 2+ of them — same idea as the overlap tool below, minus manually gathering addresses yourself. Uses GeckoTerminal's public data for token discovery (pump.fun has no official API), so this can occasionally miss a token their indexing hasn't caught yet.</div>
+    <div class="add-row">
+      <input type="text" id="pumpedMinMc" placeholder="Min market cap in $ (e.g. 50000)…">
+      <button id="pumpedBtn">Scan pump.fun</button>
+    </div>
+    <div class="status-line" id="pumpedStatus"></div>
+    <div id="pumpedResults"></div>
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Find wallets with a cross-token track record</div>
     <div class="status-line" style="margin-bottom:10px;">Give it several tokens that already pumped — it finds wallets that currently hold more than one of them. Catching one pump could be luck; holding three winners in a row is a real signal.</div>
     <div class="add-row">
@@ -665,6 +676,66 @@ $('scoreBtn').addEventListener('click', async ()=>{
     statusEl.textContent = 'Scoring failed.'; statusEl.className='status-line err';
   }finally{
     $('scoreBtn').disabled = false;
+  }
+});
+
+$('pumpedBtn').addEventListener('click', async ()=>{
+  const minMc = $('pumpedMinMc').value.trim();
+  const statusEl = $('pumpedStatus');
+  const resultsEl = $('pumpedResults');
+  resultsEl.innerHTML = '';
+  if(!minMc || Number(minMc) <= 0){ statusEl.textContent = 'Enter a market cap threshold above 0.'; statusEl.className='status-line err'; return; }
+
+  $('pumpedBtn').disabled = true;
+  statusEl.textContent = 'Finding pumped tokens on pump.fun, then checking holder overlap…';
+  statusEl.className = 'status-line';
+  try{
+    const res = await fetch(`/api/pumped-overlap?minMc=${encodeURIComponent(minMc)}`);
+    const data = await res.json();
+    if(data.error){ statusEl.textContent = data.error; statusEl.className='status-line err'; return; }
+
+    const tokensFound = data.tokensFound || [];
+    if(!tokensFound.length){
+      statusEl.textContent = `No pump.fun tokens found above $${Number(minMc).toLocaleString()} market cap right now. Try a lower threshold.`;
+      statusEl.className = 'status-line err';
+      return;
+    }
+
+    const foundList = tokensFound.map(t => (t.symbol ? '$'+t.symbol : short(t.mint)) + ' (~$' + fmtNum(t.marketCap) + ')').join(', ');
+
+    if(data.note){
+      statusEl.innerHTML = `Found: ${foundList}<br>${data.note}`;
+      statusEl.className = 'status-line err';
+      return;
+    }
+
+    const results = data.results || [];
+    statusEl.innerHTML = `Found: ${foundList}<br>${results.length} wallet${results.length===1?'':'s'} hold 2+ of them.`;
+    statusEl.className = results.length ? 'status-line ok' : 'status-line err';
+
+    if(!results.length){
+      resultsEl.innerHTML = `<div class="empty">No wallet appears as a real holder across more than one of these ${tokensFound.length} tokens.</div>`;
+      return;
+    }
+
+    resultsEl.innerHTML = results.map(r=>{
+      const tokenTags = r.tokens.map(t => {
+        const sym = t.symbol ? '$'+t.symbol : short(t.mint);
+        return `${sym} (${t.pctSupply.toFixed(2)}%)`;
+      }).join(', ');
+      return `
+      <div class="wallet-row">
+        <div>
+          <div class="wallet-name">${short(r.address)} · holds ${r.count} of ${tokensFound.length}</div>
+          <div class="wallet-addr">${tokenTags}</div>
+        </div>
+        <a class="trade-link" href="https://solscan.io/account/${r.address}" target="_blank" rel="noopener">view ↗</a>
+      </div>`;
+    }).join('');
+  }catch(e){
+    statusEl.textContent = 'Scan failed.'; statusEl.className='status-line err';
+  }finally{
+    $('pumpedBtn').disabled = false;
   }
 });
 
